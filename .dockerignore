@@ -1,0 +1,6 @@
+node_modules
+downloads
+.git
+.env
+*.pdf
+*.log
