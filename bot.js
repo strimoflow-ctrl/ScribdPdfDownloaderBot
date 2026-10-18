@@ -81,12 +81,11 @@ function cleanOldDownloads() {
 setInterval(cleanOldDownloads, 3 * 60 * 1000);
 
 // -------------------------------------------------------------
-// Concurrency & Rate Limiting System
+// Safe Queue & Concurrency System (Railway Free Tier Optimized)
 // -------------------------------------------------------------
-// 1 download per user limit
 const activeUsers = new Set();
-// Server concurrency limit (max 2 downloads in parallel for Railway stability)
-const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '2', 10);
+// On Railway Free Tier (512MB RAM), MAX_CONCURRENT=1 guarantees ZERO crashes
+const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '1', 10);
 let runningCount = 0;
 const queue = [];
 
@@ -103,17 +102,22 @@ function scheduleNext() {
 // -------------------------------------------------------------
 // Task Execution with Single Dynamic Message
 // -------------------------------------------------------------
-async function executeTask({ chatId, userId, docId }) {
+async function executeTask({ chatId, userId, docId, queuedMsgId }) {
   const startTime = Date.now();
   let statusMsg = null;
   let lastEditTime = 0;
   let lastRenderedText = '';
 
+  // Reuse initial queue message if available
+  if (queuedMsgId) {
+    statusMsg = { message_id: queuedMsgId };
+  }
+
   // Throttled message editor to avoid Telegram 429 rate limit
   const updateStatus = async (statusData, force = false) => {
     const now = Date.now();
     if (!force && (now - lastEditTime < 1100)) {
-      return; // Skip edit if called faster than ~1.1s
+      return;
     }
 
     const elapsed = (now - startTime) / 1000;
@@ -125,30 +129,30 @@ async function executeTask({ chatId, userId, docId }) {
 
     if (statusData.stage === 'connecting') {
       stageHeader = '🔍 *CONNECTING TO SCRIBD*';
-      bodyText =
+      bodyText = 
         `${statusData.text || 'Connecting to Scribd servers...'}\n` +
         `[${bar}] ${percent}%\n` +
         `⏳ *Time:* ${formatSeconds(elapsed)}`;
     } else if (statusData.stage === 'rendering') {
       stageHeader = '⚡ *RENDERING HD PAGES*';
-      bodyText =
+      bodyText = 
         `${statusData.text || 'Rendering pages...'}\n` +
         `[${bar}] ${percent}%\n` +
         `⏳ *Time:* ${formatSeconds(elapsed)}`;
     } else if (statusData.stage === 'uploading') {
       stageHeader = '📤 *UPLOADING TO TELEGRAM*';
-      bodyText =
+      bodyText = 
         `${statusData.text || 'Sending document...'}\n` +
         `[${bar}] ${percent}%\n` +
         `⏳ *Time:* ${formatSeconds(elapsed)}`;
     } else {
-      bodyText =
+      bodyText = 
         `${statusData.text || 'Processing document...'}\n` +
         `[${bar}] ${percent}%\n` +
         `⏳ *Time:* ${formatSeconds(elapsed)}`;
     }
 
-    const fullMessage =
+    const fullMessage = 
       `${stageHeader}\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
       `${bodyText}\n` +
@@ -167,7 +171,7 @@ async function executeTask({ chatId, userId, docId }) {
           chat_id: chatId,
           message_id: statusMsg.message_id,
           parse_mode: 'Markdown'
-        }).catch(() => { });
+        }).catch(() => {});
       }
     } catch (e) {
       console.warn('UI update notice:', e.message);
@@ -175,10 +179,10 @@ async function executeTask({ chatId, userId, docId }) {
   };
 
   try {
-    // Initial stage: Connecting 0%
+    // Stage 1: Connecting
     await updateStatus({
       stage: 'connecting',
-      percent: 10,
+      percent: 15,
       text: '🚀 *Launching browser engine...*'
     }, true);
 
@@ -188,17 +192,16 @@ async function executeTask({ chatId, userId, docId }) {
 
     const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
-    // Stage 3: Uploading (0% -> 100%)
+    // Stage 3: Uploading
     await updateStatus({
       stage: 'uploading',
-      percent: 30,
+      percent: 40,
       text: `📤 *Uploading PDF to Telegram (${result.fileSizeMB} MB)...*`
     }, true);
 
-    // Animated upload progress simulation while network transfer completes
-    let currentUpload = 30;
+    let currentUpload = 40;
     const uploadInterval = setInterval(() => {
-      currentUpload = Math.min(95, currentUpload + 30);
+      currentUpload = Math.min(95, currentUpload + 25);
       updateStatus({
         stage: 'uploading',
         percent: currentUpload,
@@ -206,7 +209,7 @@ async function executeTask({ chatId, userId, docId }) {
       });
     }, 1200);
 
-    const caption =
+    const caption = 
       `📚 *${result.title || 'Scribd Document'}*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
       `📑 *Total Pages:* ${result.pageCount} Pages\n` +
@@ -225,7 +228,7 @@ async function executeTask({ chatId, userId, docId }) {
 
     // Delete dynamic progress message after delivery
     if (statusMsg) {
-      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => { });
+      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
     }
 
     console.log(`✅ [Delivery Success] Doc ${docId} delivered to User ${userId} in ${totalElapsed}s`);
@@ -242,7 +245,7 @@ async function executeTask({ chatId, userId, docId }) {
           message_id: statusMsg.message_id,
           parse_mode: 'Markdown'
         }
-      ).catch(() => { });
+      ).catch(() => {});
     }
   } finally {
     // Release user lock
@@ -257,7 +260,7 @@ bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   const firstName = msg.from && msg.from.first_name ? msg.from.first_name : 'Dost';
 
-  const welcomeText =
+  const welcomeText = 
     `🌟 *WELCOME TO SCRIBD HD DOWNLOADER*\n` +
     `━━━━━━━━━━━━━━━━━━━━━━━\n` +
     `Namaste *${firstName}*! Ab aap Scribd ke kisi bhi document ko bilkul *FREE* aur *100% Original Quality* me download kar sakte hain! 🚀\n\n` +
@@ -319,8 +322,8 @@ bot.on('message', async (msg) => {
   if (activeUsers.has(userId)) {
     return bot.sendMessage(
       chatId,
-      `⚠️ *Ek Download Pehle Se Chal Raha Hai!*\n\n` +
-      `Aapka ek document abhi process ho raha hai. Kripya uske poora hone ka intezar karein!\n\n` +
+      `⚠️ *Aapka Ek Download Pehle Se Chal Raha Hai!*\n\n` +
+      `Kripya uske poora hone ka intezar karein!\n\n` +
       `_Service sabhi ke liye smooth rahe isliye ek bar me 1 download allowed hai._ ⚡`,
       { parse_mode: 'Markdown' }
     );
@@ -329,7 +332,20 @@ bot.on('message', async (msg) => {
   // Mark user as active
   activeUsers.add(userId);
 
+  // If another user is already rendering, show polite queue position message
+  let queuedMsgId = null;
+  if (runningCount >= MAX_CONCURRENT) {
+    const queuePos = queue.length + 1;
+    const qMsg = await bot.sendMessage(
+      chatId,
+      `⏳ *Request Queue Me Hai (#${queuePos})*\n\n` +
+      `Server par ek document abhi render ho raha hai. Jaise hi wo poora hoga, aapka download *automatically* shuru ho jayega! 🚀`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => null);
+    if (qMsg) queuedMsgId = qMsg.message_id;
+  }
+
   // Push into processing queue
-  queue.push({ chatId, userId, docId });
+  queue.push({ chatId, userId, docId, queuedMsgId });
   scheduleNext();
 });
