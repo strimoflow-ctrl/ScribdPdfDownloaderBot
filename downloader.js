@@ -214,38 +214,48 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         text: `⚡ *Rendering:* Page ${i} of ${totalPages}`
       });
 
-      // 1. Tell Scribd's viewer to navigate to page i and trigger lazy-load
+      // 1. Scroll Scribd's REAL internal container (.document_scroller) and trigger viewer
       await page.evaluate((idx) => {
+        const scroller = document.querySelector('.document_scroller');
+        const el = document.getElementById(`outer_page_${idx}`);
+        if (!el) return;
+
+        if (scroller) {
+          scroller.scrollTop = el.offsetTop;
+          scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+        }
+        el.scrollIntoView({ behavior: 'instant', block: 'start' });
+
         if (window.docManager && typeof window.docManager.gotoPage === 'function') {
           window.docManager.gotoPage(idx);
         }
-        const el = document.getElementById(`outer_page_${idx}`);
-        if (el) {
-          el.scrollIntoView({ behavior: 'instant', block: 'start' });
-          const imgs = el.querySelectorAll('img');
-          imgs.forEach(img => {
-            if (!img.src && img.dataset.src) img.src = img.dataset.src;
-            img.style.opacity = '1';
-            img.style.visibility = 'visible';
-          });
-        }
+
+        const imgs = el.querySelectorAll('img');
+        imgs.forEach(img => {
+          if (!img.src && img.dataset.src) img.src = img.dataset.src;
+          img.style.opacity = '1';
+          img.style.visibility = 'visible';
+        });
       }, i);
 
-      // 2. Wait until page content (image or text layer) is actually loaded by Scribd
-      await page.waitForFunction((idx) => {
-        const el = document.getElementById(`outer_page_${idx}`);
-        if (!el) return false;
-        const newpage = el.querySelector('.newpage');
-        if (newpage) return true;
-        const img = el.querySelector('img');
-        if (img && img.src && (img.complete || img.naturalWidth > 0)) return true;
-        const textLayer = el.querySelector('.text_layer');
-        if (textLayer) return true;
-        return false;
-      }, { timeout: 8000 }, i).catch(() => {});
-
-      // Brief raster settling to ensure crisp font and image rendering
-      await new Promise(r => setTimeout(r, 200));
+      // 2. Fast active wait for content (image, newpage, or text layer) to populate without stalling
+      let contentReady = false;
+      const waitStart = Date.now();
+      while (Date.now() - waitStart < 1500) {
+        contentReady = await page.evaluate((idx) => {
+          const el = document.getElementById(`outer_page_${idx}`);
+          if (!el) return false;
+          const newpage = el.querySelector('.newpage');
+          if (newpage && newpage.children.length > 0) return true;
+          const img = el.querySelector('img');
+          if (img && img.src && (img.complete || img.naturalWidth > 0)) return true;
+          const textLayer = el.querySelector('.text_layer');
+          if (textLayer) return true;
+          return false;
+        }, i);
+        if (contentReady) break;
+        await new Promise(r => setTimeout(r, 80));
+      }
 
       const pageElement = await page.$(`#outer_page_${i}`);
       if (!pageElement) {
