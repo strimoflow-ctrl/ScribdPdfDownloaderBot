@@ -214,22 +214,37 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         text: `⚡ *Rendering:* Page ${i} of ${totalPages}`
       });
 
-      // Scroll into view & ensure lazy images trigger without hanging
+      // 1. Tell Scribd's viewer to navigate to page i and trigger lazy-load
       await page.evaluate((idx) => {
+        if (window.docManager && typeof window.docManager.gotoPage === 'function') {
+          window.docManager.gotoPage(idx);
+        }
         const el = document.getElementById(`outer_page_${idx}`);
-        if (!el) return;
-        el.style.display = 'block';
-        el.scrollIntoView({ behavior: 'instant', block: 'start' });
-
-        const imgs = el.querySelectorAll('img');
-        imgs.forEach(img => {
-          if (!img.src && img.dataset.src) img.src = img.dataset.src;
-          img.style.opacity = '1';
-          img.style.visibility = 'visible';
-        });
+        if (el) {
+          el.scrollIntoView({ behavior: 'instant', block: 'start' });
+          const imgs = el.querySelectorAll('img');
+          imgs.forEach(img => {
+            if (!img.src && img.dataset.src) img.src = img.dataset.src;
+            img.style.opacity = '1';
+            img.style.visibility = 'visible';
+          });
+        }
       }, i);
 
-      // Brief raster settling to give browser and CDN enough time
+      // 2. Wait until page content (image or text layer) is actually loaded by Scribd
+      await page.waitForFunction((idx) => {
+        const el = document.getElementById(`outer_page_${idx}`);
+        if (!el) return false;
+        const newpage = el.querySelector('.newpage');
+        if (newpage) return true;
+        const img = el.querySelector('img');
+        if (img && img.src && (img.complete || img.naturalWidth > 0)) return true;
+        const textLayer = el.querySelector('.text_layer');
+        if (textLayer) return true;
+        return false;
+      }, { timeout: 8000 }, i).catch(() => {});
+
+      // Brief raster settling to ensure crisp font and image rendering
       await new Promise(r => setTimeout(r, 200));
 
       const pageElement = await page.$(`#outer_page_${i}`);
@@ -258,16 +273,6 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       });
 
       addClickableWatermark(pdfDoc, pdfPage, watermarkFont, botUsername);
-
-      // 🧹 CRITICAL RAM OPTIMIZATION:
-      // Hide previously captured pages (display = 'none') so Chromium drops GPU textures
-      // while keeping the DOM structure intact (avoids breaking Scribd V8 scripts / timeouts)
-      await page.evaluate((idx) => {
-        const prev = document.getElementById(`outer_page_${idx}`);
-        if (prev) {
-          prev.style.display = 'none';
-        }
-      }, i);
     }
 
     const pdfBytes = await pdfDoc.save();
