@@ -114,7 +114,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
   const browser = await puppeteer.launch({
     headless: 'new',
     executablePath,
-    protocolTimeout: 300000, // 5 minutes to prevent CDP timeout
+    protocolTimeout: 600000, // 10 minutes to prevent CDP timeout on 300+ pages
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
@@ -215,33 +215,21 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       });
 
       // Scroll into view & ensure lazy images trigger without hanging
-      await page.evaluate(async (idx) => {
+      await page.evaluate((idx) => {
         const el = document.getElementById(`outer_page_${idx}`);
         if (!el) return;
-        el.scrollIntoView({ behavior: 'instant', block: 'center' });
+        el.scrollIntoView({ behavior: 'instant', block: 'start' });
 
-        const imgs = Array.from(el.querySelectorAll('img'));
-        for (const img of imgs) {
+        const imgs = el.querySelectorAll('img');
+        imgs.forEach(img => {
           if (!img.src && img.dataset.src) img.src = img.dataset.src;
           img.style.opacity = '1';
           img.style.visibility = 'visible';
-        }
-
-        // Quick image settle check: wait for completion or max 600ms
-        await Promise.race([
-          Promise.all(imgs.map(img => {
-            if (img.complete && img.naturalWidth > 0) return Promise.resolve();
-            return new Promise(res => {
-              img.onload = res;
-              img.onerror = res;
-            });
-          })),
-          new Promise(res => setTimeout(res, 600))
-        ]);
+        });
       }, i);
 
       // Brief raster settling
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise(r => setTimeout(r, 220));
 
       const pageElement = await page.$(`#outer_page_${i}`);
       if (!pageElement) {
@@ -253,7 +241,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       let embeddedImage;
 
       if (useJpeg) {
-        imgBuffer = await pageElement.screenshot({ type: 'jpeg', quality: 88 });
+        imgBuffer = await pageElement.screenshot({ type: 'jpeg', quality: 90 });
         embeddedImage = await pdfDoc.embedJpg(imgBuffer);
       } else {
         imgBuffer = await pageElement.screenshot({ type: 'png', omitBackground: false });
@@ -269,6 +257,17 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       });
 
       addClickableWatermark(pdfDoc, pdfPage, watermarkFont, botUsername);
+
+      // 🧹 CRITICAL RAM OPTIMIZATION: Preserve container height so scroll position
+      // never shifts, but clear innerHTML so Chromium drops decoded textures immediately!
+      await page.evaluate((idx) => {
+        const prev = document.getElementById(`outer_page_${idx}`);
+        if (prev) {
+          const h = prev.offsetHeight || 1400;
+          prev.style.height = `${h}px`;
+          prev.innerHTML = '';
+        }
+      }, i);
     }
 
     const pdfBytes = await pdfDoc.save();

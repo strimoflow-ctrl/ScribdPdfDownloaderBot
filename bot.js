@@ -1,6 +1,7 @@
 const TelegramBot = require('node-telegram-bot-api');
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const dotenv = require('dotenv');
 const { downloadScribdDocument } = require('./downloader');
 
@@ -77,8 +78,65 @@ function cleanOldDownloads() {
     }
   });
 }
-// Run cleaner every 3 minutes
+// Run cleaner at startup and every 3 minutes
+cleanOldDownloads();
 setInterval(cleanOldDownloads, 3 * 60 * 1000);
+
+// -------------------------------------------------------------
+// HTTP Server: Serves files > 50MB via direct high-speed download link
+// -------------------------------------------------------------
+function getPublicDownloadUrl(filePath) {
+  const fileName = encodeURIComponent(path.basename(filePath));
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || process.env.PUBLIC_URL || process.env.SERVER_URL;
+  if (domain) {
+    const proto = domain.startsWith('http') ? '' : 'https://';
+    return `${proto}${domain}/download/${fileName}`;
+  }
+  const port = process.env.PORT || 3000;
+  return `http://localhost:${port}/download/${fileName}`;
+}
+
+const server = http.createServer((req, res) => {
+  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  if (parsedUrl.pathname.startsWith('/download/')) {
+    const rawFileName = decodeURIComponent(parsedUrl.pathname.replace('/download/', ''));
+    const safeFileName = path.basename(rawFileName);
+    const downloadsDir = path.join(__dirname, 'downloads');
+    const targetPath = path.join(downloadsDir, safeFileName);
+
+    if (fs.existsSync(targetPath)) {
+      const stat = fs.statSync(targetPath);
+      res.writeHead(200, {
+        'Content-Type': 'application/pdf',
+        'Content-Length': stat.size,
+        'Content-Disposition': `attachment; filename="${safeFileName}"`,
+        'Cache-Control': 'no-cache'
+      });
+      const stream = fs.createReadStream(targetPath);
+      stream.pipe(res);
+      return;
+    } else {
+      res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`
+        <div style="font-family: sans-serif; text-align: center; padding: 50px;">
+          <h2>❌ File Expired or Not Found</h2>
+          <p>Yeh file 30 minute ke expiry period ke baad server se delete ho chuki hai.</p>
+          <p>Kripya Telegram bot me link dobara bhej kar fresh copy download karein.</p>
+        </div>
+      `);
+      return;
+    }
+  }
+
+  // Health check endpoint for Railway
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Scribd Telegram Downloader Bot is active.');
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`🌐 HTTP Server & Download Service active on port ${PORT}`);
+});
 
 // -------------------------------------------------------------
 // Safe Queue & Concurrency System (Railway Free Tier Optimized)
@@ -219,16 +277,53 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
       `👨‍💻 *Developer:* @cryvex4`;
 
-    await bot.sendDocument(chatId, result.pdfPath, {
-      caption,
-      parse_mode: 'Markdown'
-    });
+    const fileSizeNum = parseFloat(result.fileSizeMB);
 
-    clearInterval(uploadInterval);
+    // If file is > 49.5 MB, Telegram rejects it. Provide direct server download link (valid 30 mins)
+    if (fileSizeNum > 49.5) {
+      clearInterval(uploadInterval);
+      if (statusMsg) {
+        await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      }
 
-    // Delete dynamic progress message after delivery
-    if (statusMsg) {
-      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      const downloadUrl = getPublicDownloadUrl(result.pdfPath);
+
+      const largeFileMsg = 
+        `📚 *${result.title || 'Scribd Document'}*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📑 *Total Pages:* ${result.pageCount} Pages\n` +
+        `📦 *File Size:* ${result.fileSizeMB} MB *(Large File)*\n` +
+        `⚡ *Download Time:* ${totalElapsed}s\n` +
+        `🎯 *Quality:* 100% Lossless (No Clipping)\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `⚠️ *Telegram 50MB Limit Exceeded!*\n` +
+        `Yeh PDF 50MB se bada hai, isliye ise direct Telegram chat me nahi bheja ja sakta.\n\n` +
+        `Aap niche diye gaye *Direct Server Link* se is PDF ko download kar sakte hain:\n\n` +
+        `🔗 *Download Link:* [Click Here to Download](${downloadUrl})\n\n` +
+        `⏳ *Dhyan dein:* Yeh link sirf *30 minute* ke liye valid hai. 30 minute baad file server se automatically delete kar di jayegi!\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `👨‍💻 *Developer:* @cryvex4`;
+
+      await bot.sendMessage(chatId, largeFileMsg, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '📥 Download PDF (30 Min Expiry)', url: downloadUrl }]
+          ]
+        }
+      });
+    } else {
+      await bot.sendDocument(chatId, result.pdfPath, {
+        caption,
+        parse_mode: 'Markdown'
+      });
+
+      clearInterval(uploadInterval);
+
+      // Delete dynamic progress message after delivery
+      if (statusMsg) {
+        await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+      }
     }
 
     console.log(`✅ [Delivery Success] Doc ${docId} delivered to User ${userId} in ${totalElapsed}s`);
