@@ -171,10 +171,15 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
     statusMsg = { message_id: queuedMsgId };
   }
 
-  // Throttled message editor to avoid Telegram 429 rate limit (3.5s interval avoids flood wait)
+  let lastStage = '';
+
+  // Throttled message editor to avoid Telegram 429 rate limit while updating immediately on stage change
   const updateStatus = async (statusData, force = false) => {
     const now = Date.now();
-    if (!force && (now - lastEditTime < 3500)) {
+    const isStageChange = statusData.stage && statusData.stage !== lastStage;
+    if (statusData.stage) lastStage = statusData.stage;
+
+    if (!force && !isStageChange && (statusData.percent !== 100) && (now - lastEditTime < 2200)) {
       return;
     }
 

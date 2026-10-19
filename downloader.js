@@ -228,8 +228,8 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         });
       }, i);
 
-      // Brief raster settling
-      await new Promise(r => setTimeout(r, 220));
+      // Brief raster settling to give browser and CDN enough time
+      await new Promise(r => setTimeout(r, 350));
 
       const pageElement = await page.$(`#outer_page_${i}`);
       if (!pageElement) {
