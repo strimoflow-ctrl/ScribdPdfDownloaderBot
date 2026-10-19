@@ -172,19 +172,22 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
   }
 
   let lastStage = '';
+  let lastReportedPercent = -1;
 
-  // Throttled message editor to avoid Telegram 429 rate limit while updating immediately on stage change
+  // Throttled message editor: Steps every 5% and on stage change to strictly avoid Telegram's per-message edit lock (~25 edits max)
   const updateStatus = async (statusData, force = false) => {
     const now = Date.now();
+    const percent = Math.min(100, Math.max(0, statusData.percent || 0));
     const isStageChange = statusData.stage && statusData.stage !== lastStage;
     if (statusData.stage) lastStage = statusData.stage;
 
-    if (!force && !isStageChange && (statusData.percent !== 100) && (now - lastEditTime < 2200)) {
+    const percentDiff = Math.abs(percent - lastReportedPercent);
+    if (!force && !isStageChange && percent !== 100 && percentDiff < 5) {
       return;
     }
+    lastReportedPercent = percent;
 
     const elapsed = (now - startTime) / 1000;
-    const percent = Math.min(100, Math.max(0, statusData.percent || 0));
     const bar = getProgressBar(percent);
 
     let stageHeader = '⚡ *SCRIBD HD DOWNLOADER*';
