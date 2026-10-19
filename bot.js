@@ -171,10 +171,10 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
     statusMsg = { message_id: queuedMsgId };
   }
 
-  // Throttled message editor to avoid Telegram 429 rate limit
+  // Throttled message editor to avoid Telegram 429 rate limit (3.5s interval avoids flood wait)
   const updateStatus = async (statusData, force = false) => {
     const now = Date.now();
-    if (!force && (now - lastEditTime < 1100)) {
+    if (!force && (now - lastEditTime < 3500)) {
       return;
     }
 
