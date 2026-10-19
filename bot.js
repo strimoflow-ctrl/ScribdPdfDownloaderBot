@@ -15,7 +15,13 @@ if (!BOT_TOKEN || BOT_TOKEN === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
   process.exit(1);
 }
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: {
+    params: {
+      allowed_updates: ['message', 'callback_query', 'chat_member', 'my_chat_member']
+    }
+  }
+});
 
 let botUsername = 'ScribdPdfDownloaderBot';
 bot.getMe().then(me => {
@@ -26,11 +32,42 @@ bot.getMe().then(me => {
 });
 
 const FORCE_SUB_CHANNEL = process.env.FORCE_SUB_CHANNEL || ''; // e.g. @MyChannel or -100...
-const FORCE_SUB_URL = process.env.FORCE_SUB_URL || (FORCE_SUB_CHANNEL ? `https://t.me/${FORCE_SUB_CHANNEL.replace('@', '')}` : '');
+let cachedInviteLink = process.env.FORCE_SUB_URL || '';
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ''; // e.g. @MyPublicGroup or -100...
 
-console.log('🚀 Scribd HD PDF Downloader Engine initialized.');
-if (FORCE_SUB_CHANNEL) console.log(`📢 Force Subscribe active on: ${FORCE_SUB_CHANNEL}`);
+// Resolve channel invite link automatically (handles @username and private -100... channels)
+async function getChannelInviteUrl() {
+  if (cachedInviteLink) return cachedInviteLink;
+  if (!FORCE_SUB_CHANNEL) return '';
+
+  if (FORCE_SUB_CHANNEL.startsWith('@')) {
+    cachedInviteLink = `https://t.me/${FORCE_SUB_CHANNEL.replace('@', '')}`;
+    return cachedInviteLink;
+  }
+
+  try {
+    const chat = await bot.getChat(FORCE_SUB_CHANNEL);
+    if (chat.username) {
+      cachedInviteLink = `https://t.me/${chat.username}`;
+    } else if (chat.invite_link) {
+      cachedInviteLink = chat.invite_link;
+    } else {
+      cachedInviteLink = await bot.exportChatInviteLink(FORCE_SUB_CHANNEL);
+    }
+    console.log(`🔗 [FSub] Resolved channel invite link: ${cachedInviteLink}`);
+    return cachedInviteLink;
+  } catch (err) {
+    console.warn(`[FSub Link Error] Could not export chat invite link for ${FORCE_SUB_CHANNEL}: ${err.message}`);
+    return '';
+  }
+}
+
+// Pre-fetch link on startup if configured
+if (FORCE_SUB_CHANNEL) {
+  getChannelInviteUrl().then(url => {
+    if (url) console.log(`📢 Force Subscribe active on: ${FORCE_SUB_CHANNEL} (${url})`);
+  });
+}
 if (LOG_CHANNEL_ID) console.log(`📡 Public Channel Forwarding active on: ${LOG_CHANNEL_ID}`);
 
 // Helper: Extract Scribd Document ID and URL Slug
@@ -86,16 +123,20 @@ async function checkMembership(userId) {
 
 // Sleek, compact join prompt
 async function sendJoinPrompt(chatId, docId = null, urlSlug = null) {
+  const inviteUrl = await getChannelInviteUrl();
   const text = 
     `🔒 *Access Locked!*\n\n` +
     `Bot use karne ke liye pehle hamare official channel ko join karein. Join karte hi aapka download activate ho jayega! ✨`;
 
   const callbackData = docId ? `check_${docId}${urlSlug ? ':' + urlSlug : ''}` : 'check_idle';
+  const buttons = [];
+  if (inviteUrl) {
+    buttons.push([{ text: '📢 Join Official Channel', url: inviteUrl }]);
+  }
+  buttons.push([{ text: '🔄 Joined / Try Again', callback_data: callbackData }]);
+
   const keyboard = {
-    inline_keyboard: [
-      [{ text: '📢 Join Official Channel', url: FORCE_SUB_URL }],
-      [{ text: '🔄 Joined / Try Again', callback_data: callbackData }]
-    ]
+    inline_keyboard: buttons
   };
 
   return bot.sendMessage(chatId, text, {
@@ -608,4 +649,52 @@ bot.on('message', async (msg) => {
   }
 
   startDownloadTask(chatId, userId, msg.from, info.docId, info.urlSlug);
+});
+
+// -------------------------------------------------------------
+// Real-time Channel Leave Detector (Warns user instantly on leave)
+// -------------------------------------------------------------
+bot.on('chat_member', async (update) => {
+  try {
+    if (!FORCE_SUB_CHANNEL) return;
+
+    const updateChatId = update.chat.id.toString();
+    const targetChannel = FORCE_SUB_CHANNEL.toString();
+
+    const isTargetChannel =
+      updateChatId === targetChannel ||
+      (update.chat.username && `@${update.chat.username}`.toLowerCase() === targetChannel.toLowerCase());
+
+    if (!isTargetChannel) return;
+
+    const oldStatus = update.old_chat_member ? update.old_chat_member.status : '';
+    const newStatus = update.new_chat_member ? update.new_chat_member.status : '';
+    const targetUserId = update.new_chat_member?.user?.id || update.from?.id;
+
+    if (['member', 'administrator'].includes(oldStatus) && ['left', 'kicked', 'restricted'].includes(newStatus)) {
+      if (targetUserId) {
+        const inviteUrl = await getChannelInviteUrl();
+        const buttons = [];
+        if (inviteUrl) {
+          buttons.push([{ text: '📢 Re-Join Channel', url: inviteUrl }]);
+        }
+        buttons.push([{ text: '🔄 Verify Membership', callback_data: 'check_idle' }]);
+
+        await bot.sendMessage(
+          targetUserId,
+          `⚠️ *Aapne Channel Leave Kar Diya Hai!*\n\n` +
+          `Aap official channel se nikal chuke hain, isliye aapka download access lock ho gaya hai. ❌\n\n` +
+          `Download suvidha turant wapas activate karne ke liye kripya channel dobara join karein! ✨`,
+          {
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: buttons }
+          }
+        ).catch(err => {
+          console.warn(`[Leave Notice] Could not send DM to user ${targetUserId}: ${err.message}`);
+        });
+      }
+    }
+  } catch (err) {
+    console.warn(`[chat_member error] ${err.message}`);
+  }
 });
