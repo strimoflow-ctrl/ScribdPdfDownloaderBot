@@ -138,8 +138,8 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(60000);
 
-    // 1.5x resolution: Crisp retina clarity with 55% less RAM and 3x faster rendering
-    await page.setViewport({ width: 1200, height: 1600, deviceScaleFactor: 1.5 });
+    // 1.2x resolution: Crisp retina clarity with minimum RAM and fast rendering
+    await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: 1.2 });
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
@@ -218,6 +218,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       await page.evaluate((idx) => {
         const el = document.getElementById(`outer_page_${idx}`);
         if (!el) return;
+        el.style.display = 'block';
         el.scrollIntoView({ behavior: 'instant', block: 'start' });
 
         const imgs = el.querySelectorAll('img');
@@ -229,7 +230,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       }, i);
 
       // Brief raster settling to give browser and CDN enough time
-      await new Promise(r => setTimeout(r, 350));
+      await new Promise(r => setTimeout(r, 200));
 
       const pageElement = await page.$(`#outer_page_${i}`);
       if (!pageElement) {
@@ -241,7 +242,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       let embeddedImage;
 
       if (useJpeg) {
-        imgBuffer = await pageElement.screenshot({ type: 'jpeg', quality: 90 });
+        imgBuffer = await pageElement.screenshot({ type: 'jpeg', quality: 88 });
         embeddedImage = await pdfDoc.embedJpg(imgBuffer);
       } else {
         imgBuffer = await pageElement.screenshot({ type: 'png', omitBackground: false });
@@ -258,14 +259,13 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
 
       addClickableWatermark(pdfDoc, pdfPage, watermarkFont, botUsername);
 
-      // 🧹 CRITICAL RAM OPTIMIZATION: Preserve container height so scroll position
-      // never shifts, but clear innerHTML so Chromium drops decoded textures immediately!
+      // 🧹 CRITICAL RAM OPTIMIZATION:
+      // Hide previously captured pages (display = 'none') so Chromium drops GPU textures
+      // while keeping the DOM structure intact (avoids breaking Scribd V8 scripts / timeouts)
       await page.evaluate((idx) => {
         const prev = document.getElementById(`outer_page_${idx}`);
         if (prev) {
-          const h = prev.offsetHeight || 1400;
-          prev.style.height = `${h}px`;
-          prev.innerHTML = '';
+          prev.style.display = 'none';
         }
       }, i);
     }
