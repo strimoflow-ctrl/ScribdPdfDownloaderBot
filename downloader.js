@@ -97,7 +97,7 @@ function addClickableWatermark(pdfDoc, page, font, botUsername = 'ScribdPdfDownl
  * @param {string} botUsername - For clickable watermark
  * @returns {Promise<{ pdfPath: string, title: string, pageCount: number, fileSizeMB: string }>}
  */
-async function downloadScribdDocument(docId, onProgress = () => {}, botUsername = 'ScribdPdfDownloaderBot') {
+async function downloadScribdDocument(docId, onProgress = () => {}, botUsername = 'ScribdPdfDownloaderBot', preferredTitle = null) {
   const executablePath = getBrowserExecutablePath();
   const downloadsDir = path.join(__dirname, 'downloads');
   if (!fs.existsSync(downloadsDir)) {
@@ -163,10 +163,13 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     await new Promise(r => setTimeout(r, 2500));
 
     // Extract clean title
-    let docTitle = await page.evaluate(() => {
-      const titleEl = document.querySelector('title') || document.querySelector('.document_title');
-      return titleEl ? titleEl.textContent.replace(/Scribd/i, '').trim() : '';
-    });
+    let docTitle = preferredTitle;
+    if (!docTitle) {
+      docTitle = await page.evaluate(() => {
+        const titleEl = document.querySelector('title') || document.querySelector('.document_title');
+        return titleEl ? titleEl.textContent.replace(/Scribd/i, '').trim() : '';
+      });
+    }
     if (!docTitle) docTitle = `Scribd_Doc_${docId}`;
     const safeTitle = docTitle.replace(/[/\\?%*:|"<>]/g, '_').slice(0, 60);
 
@@ -313,7 +316,16 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     }
 
     const pdfBytes = await pdfDoc.save();
-    const outputPath = path.join(downloadsDir, `${safeTitle}_${docId}.pdf`);
+    // Clean, professional filename (e.g. 151-Skin-Cases-Diagnosis-and-Treatment.pdf)
+    const cleanFileName = (docTitle || `Scribd_Doc_${docId}`)
+      .replace(/[/\\?%*:|"<>]/g, '')
+      .replace(/&amp;/g, '&')
+      .replace(/\s+/g, '-')
+      .replace(/-+/g, '-')
+      .slice(0, 50)
+      .replace(/^-+|-+$/g, '') || `Scribd_${docId}`;
+
+    const outputPath = path.join(downloadsDir, `${cleanFileName}.pdf`);
     fs.writeFileSync(outputPath, pdfBytes);
 
     const stats = fs.statSync(outputPath);

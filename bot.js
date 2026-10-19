@@ -25,21 +25,83 @@ bot.getMe().then(me => {
   console.warn('Bot info fetch warning:', err.message);
 });
 
+const FORCE_SUB_CHANNEL = process.env.FORCE_SUB_CHANNEL || ''; // e.g. @MyChannel or -100...
+const FORCE_SUB_URL = process.env.FORCE_SUB_URL || (FORCE_SUB_CHANNEL ? `https://t.me/${FORCE_SUB_CHANNEL.replace('@', '')}` : '');
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID || ''; // e.g. @MyPublicGroup or -100...
+
 console.log('🚀 Scribd HD PDF Downloader Engine initialized.');
+if (FORCE_SUB_CHANNEL) console.log(`📢 Force Subscribe active on: ${FORCE_SUB_CHANNEL}`);
+if (LOG_CHANNEL_ID) console.log(`📡 Public Channel Forwarding active on: ${LOG_CHANNEL_ID}`);
 
-// Helper: Extract Scribd Document ID
-function extractScribdDocId(text) {
+// Helper: Extract Scribd Document ID and URL Slug
+function extractScribdInfo(text) {
   if (!text) return null;
-  let match = text.match(/scribd\.com\/(?:document|doc|presentation|embeds)\/(\d+)/i);
-  if (match) return match[1];
-
-  match = text.match(/[?&]doc_id=(\d+)/i);
-  if (match) return match[1];
-
+  const match = text.match(/scribd\.com\/(?:document|doc|presentation|embeds)\/(\d+)(?:\/([a-zA-Z0-9_-]+))?/i);
+  if (match) {
+    return {
+      docId: match[1],
+      urlSlug: match[2] || null
+    };
+  }
+  const idMatch = text.match(/[?&]doc_id=(\d+)/i);
+  if (idMatch) return { docId: idMatch[1], urlSlug: null };
   const trimmed = text.trim();
-  if (/^\d{6,12}$/.test(trimmed)) return trimmed;
-
+  if (/^\d{6,12}$/.test(trimmed)) return { docId: trimmed, urlSlug: null };
   return null;
+}
+
+// Helper: Quick metadata & cover fetcher
+async function fetchScribdMetadata(docId, urlSlug) {
+  let title = urlSlug ? urlSlug.replace(/[-_]+/g, ' ').trim() : '';
+  let coverUrl = null;
+  try {
+    const resp = await fetch(`https://www.scribd.com/document/${docId}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+      signal: AbortSignal.timeout(6000)
+    });
+    const html = await resp.text();
+    const tm = html.match(/<title>([^<]+)<\/title>/i);
+    if (tm) {
+      title = tm[1].split('|')[0].replace(/Scribd/i, '').replace(/&amp;/g, '&').trim();
+    }
+    const im = html.match(/<meta property="og:image" content="([^"]+)"/i);
+    if (im) {
+      coverUrl = im[1];
+    }
+  } catch (e) {}
+  return { title: title || `Scribd Document ${docId}`, coverUrl };
+}
+
+// Membership checker for Force Subscribe
+async function checkMembership(userId) {
+  if (!FORCE_SUB_CHANNEL) return true;
+  try {
+    const member = await bot.getChatMember(FORCE_SUB_CHANNEL, userId);
+    return ['member', 'administrator', 'creator'].includes(member.status);
+  } catch (err) {
+    console.warn(`[FSub Warning] ${err.message}`);
+    return true; // Don't block users if channel isn't set up or bot isn't admin
+  }
+}
+
+// Sleek, compact join prompt
+async function sendJoinPrompt(chatId, docId = null, urlSlug = null) {
+  const text = 
+    `🔒 *Access Locked!*\n\n` +
+    `Bot use karne ke liye pehle hamare official channel ko join karein. Join karte hi aapka download activate ho jayega! ✨`;
+
+  const callbackData = docId ? `check_${docId}${urlSlug ? ':' + urlSlug : ''}` : 'check_idle';
+  const keyboard = {
+    inline_keyboard: [
+      [{ text: '📢 Join Official Channel', url: FORCE_SUB_URL }],
+      [{ text: '🔄 Joined / Try Again', callback_data: callbackData }]
+    ]
+  };
+
+  return bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: keyboard
+  });
 }
 
 // Generate sleek Unicode progress bar: [████░░░░░░]
@@ -160,10 +222,9 @@ function scheduleNext() {
 // -------------------------------------------------------------
 // Task Execution with Single Dynamic Message
 // -------------------------------------------------------------
-async function executeTask({ chatId, userId, docId, queuedMsgId }) {
+async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }) {
   const startTime = Date.now();
   let statusMsg = null;
-  let lastEditTime = 0;
   let lastRenderedText = '';
 
   // Reuse initial queue message if available
@@ -227,7 +288,6 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
 
     if (fullMessage === lastRenderedText) return;
     lastRenderedText = fullMessage;
-    lastEditTime = now;
 
     try {
       if (!statusMsg) {
@@ -245,16 +305,28 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
   };
 
   try {
+    // Quick metadata & Cover Preview fetch
+    const meta = await fetchScribdMetadata(docId, urlSlug);
+
+    // Send instant book cover preview if available
+    let coverMsg = null;
+    if (meta.coverUrl) {
+      coverMsg = await bot.sendPhoto(chatId, meta.coverUrl, {
+        caption: `📖 *${meta.title}*\n⚡ *Connected! Starting high-speed render...*`,
+        parse_mode: 'Markdown'
+      }).catch(() => null);
+    }
+
     // Stage 1: Connecting
     await updateStatus({
       stage: 'connecting',
       percent: 15,
-      text: '🚀 *Launching browser engine...*'
+      text: `🚀 *Opening:* ${meta.title}`
     }, true);
 
     const result = await downloadScribdDocument(docId, async (progress) => {
       await updateStatus(progress);
-    }, botUsername);
+    }, botUsername, meta.title);
 
     const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -334,6 +406,37 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
       }
     }
 
+    // 📡 Public Channel / Group Auto-Forwarding
+    if (LOG_CHANNEL_ID) {
+      const userMention = (user && user.username) 
+        ? `@${user.username}` 
+        : ((user && user.first_name) ? user.first_name : 'Anonymous');
+
+      const logCaption = 
+        `📚 *${result.title}*\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `📑 *Pages:* ${result.pageCount} Pages\n` +
+        `📦 *Size:* ${result.fileSizeMB} MB\n` +
+        `👤 *Downloaded By:* ${userMention}\n` +
+        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🤖 *Download via:* @${botUsername}`;
+
+      if (fileSizeNum <= 49.5) {
+        await bot.sendDocument(LOG_CHANNEL_ID, result.pdfPath, {
+          caption: logCaption,
+          parse_mode: 'Markdown'
+        }).catch(e => console.warn('[Log Channel Send Error]:', e.message));
+      } else {
+        const downloadUrl = getPublicDownloadUrl(result.pdfPath);
+        await bot.sendMessage(LOG_CHANNEL_ID, logCaption, {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[{ text: '📥 Download PDF (High Speed)', url: downloadUrl }]]
+          }
+        }).catch(e => console.warn('[Log Channel Msg Error]:', e.message));
+      }
+    }
+
     console.log(`✅ [Delivery Success] Doc ${docId} delivered to User ${userId} in ${totalElapsed}s`);
   } catch (err) {
     console.error(`❌ [Download Error] Doc ${docId}:`, err);
@@ -356,11 +459,88 @@ async function executeTask({ chatId, userId, docId, queuedMsgId }) {
   }
 }
 
+// Helper: Start download task or enqueue
+async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
+  if (activeUsers.has(userId)) {
+    return bot.sendMessage(
+      chatId,
+      `⚠️ *Aapka Ek Download Pehle Se Chal Raha Hai!*\n\n` +
+      `Kripya uske poora hone ka intezar karein!\n\n` +
+      `_Service sabhi ke liye smooth rahe isliye ek bar me 1 download allowed hai._ ⚡`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  activeUsers.add(userId);
+
+  let queuedMsgId = null;
+  if (runningCount >= MAX_CONCURRENT) {
+    const queuePos = queue.length + 1;
+    const qMsg = await bot.sendMessage(
+      chatId,
+      `⏳ *Request Queue Me Hai (#${queuePos})*\n\n` +
+      `Server par ek document abhi render ho raha hai. Jaise hi wo poora hoga, aapka download *automatically* shuru ho jayega! 🚀`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => null);
+    if (qMsg) queuedMsgId = qMsg.message_id;
+  }
+
+  queue.push({ chatId, userId, user, docId, urlSlug, queuedMsgId });
+  scheduleNext();
+}
+
+// -------------------------------------------------------------
+// Callback Query Handler (Force Subscribe verification)
+// -------------------------------------------------------------
+bot.on('callback_query', async (query) => {
+  const userId = query.from.id;
+  const chatId = query.message.chat.id;
+  const data = query.data;
+
+  if (data && data.startsWith('check_')) {
+    const isMember = await checkMembership(userId);
+    if (!isMember) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '⚠️ Aapne abhi tak channel join nahi kiya hai! Kripya pehle channel join karein.',
+        show_alert: true
+      });
+    }
+
+    await bot.answerCallbackQuery(query.id, {
+      text: '✅ Membership Verified! Welcome!'
+    });
+
+    await bot.deleteMessage(chatId, query.message.message_id).catch(() => {});
+
+    const rawParam = data.replace('check_', '');
+    if (rawParam && rawParam !== 'start' && rawParam !== 'idle') {
+      const parts = rawParam.split(':');
+      const pendingDocId = parts[0];
+      const pendingSlug = parts[1] || null;
+      startDownloadTask(chatId, userId, query.from, pendingDocId, pendingSlug);
+    } else {
+      bot.sendMessage(
+        chatId,
+        `✅ *Verification Successful!*\n\nAb aap koi bhi Scribd link bhej kar download kar sakte hain! 🚀`,
+        { parse_mode: 'Markdown' }
+      );
+    }
+  }
+});
+
 // -------------------------------------------------------------
 // Command: /start
 // -------------------------------------------------------------
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
+  const userId = msg.from.id;
+
+  // Check channel membership on /start
+  const isMember = await checkMembership(userId);
+  if (!isMember) {
+    return sendJoinPrompt(chatId, null, null);
+  }
+
   const firstName = msg.from && msg.from.first_name ? msg.from.first_name : 'Dost';
 
   const welcomeText = 
@@ -409,8 +589,8 @@ bot.on('message', async (msg) => {
   const userId = msg.from.id;
   const chatId = msg.chat.id;
 
-  const docId = extractScribdDocId(text);
-  if (!docId) {
+  const info = extractScribdInfo(text);
+  if (!info) {
     return bot.sendMessage(
       chatId,
       `⚠️ *Invalid Link!*\n\n` +
@@ -421,34 +601,11 @@ bot.on('message', async (msg) => {
     );
   }
 
-  // Rate Limiting: 1 active download per user check
-  if (activeUsers.has(userId)) {
-    return bot.sendMessage(
-      chatId,
-      `⚠️ *Aapka Ek Download Pehle Se Chal Raha Hai!*\n\n` +
-      `Kripya uske poora hone ka intezar karein!\n\n` +
-      `_Service sabhi ke liye smooth rahe isliye ek bar me 1 download allowed hai._ ⚡`,
-      { parse_mode: 'Markdown' }
-    );
+  // 🔒 Real-time Force Subscribe Check on every link
+  const isMember = await checkMembership(userId);
+  if (!isMember) {
+    return sendJoinPrompt(chatId, info.docId, info.urlSlug);
   }
 
-  // Mark user as active
-  activeUsers.add(userId);
-
-  // If another user is already rendering, show polite queue position message
-  let queuedMsgId = null;
-  if (runningCount >= MAX_CONCURRENT) {
-    const queuePos = queue.length + 1;
-    const qMsg = await bot.sendMessage(
-      chatId,
-      `⏳ *Request Queue Me Hai (#${queuePos})*\n\n` +
-      `Server par ek document abhi render ho raha hai. Jaise hi wo poora hoga, aapka download *automatically* shuru ho jayega! 🚀`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => null);
-    if (qMsg) queuedMsgId = qMsg.message_id;
-  }
-
-  // Push into processing queue
-  queue.push({ chatId, userId, docId, queuedMsgId });
-  scheduleNext();
+  startDownloadTask(chatId, userId, msg.from, info.docId, info.urlSlug);
 });
