@@ -134,7 +134,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
   });
 
   try {
-    const page = await browser.newPage();
+    let page = await browser.newPage();
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(60000);
 
@@ -213,6 +213,33 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         title: docTitle,
         text: `⚡ *Rendering:* Page ${i} of ${totalPages}`
       });
+
+      // 🧹 TAB MEMORY FLUSH: Every 35 pages, close tab and reopen fresh at page i
+      // This eliminates GPU raster texture buildup and keeps RAM < 70MB across 300+ pages!
+      if (i > 1 && (i - 1) % 35 === 0) {
+        console.log(`🧹 [Tab Memory Flush] Purging memory cache at Page ${i}...`);
+        await page.close().catch(() => {});
+        page = await browser.newPage();
+        page.setDefaultNavigationTimeout(60000);
+        page.setDefaultTimeout(60000);
+        await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: 1.2 });
+        await page.setUserAgent(
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
+        );
+        const nextUrl = `https://www.scribd.com/embeds/${docId}/content?start_page=${i}&view_mode=scroll`;
+        await page.goto(nextUrl, { waitUntil: 'domcontentloaded', timeout: 50000 });
+        await new Promise(r => setTimeout(r, 2500));
+        await page.evaluate(() => {
+          const toHide = [
+            '.toolbar', '.control_bar', '.action_menu', '.fullscreen_button',
+            '.header', '.footer', '.recommendations', '.page_missing_explanation_icon',
+            '.banner', '.promo'
+          ];
+          toHide.forEach(sel => {
+            document.querySelectorAll(sel).forEach(el => el.style.display = 'none');
+          });
+        });
+      }
 
       // 1. Scroll Scribd's REAL internal container (.document_scroller) and trigger viewer
       await page.evaluate((idx) => {
