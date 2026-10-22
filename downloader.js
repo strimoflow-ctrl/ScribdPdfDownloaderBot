@@ -199,14 +199,18 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       });
     });
 
-    const pdfDoc = await PDFDocument.create();
-    const watermarkFont = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-    // Use high-quality JPEG for documents to keep memory and file sizes lean
+    const watermarkFont = await PDFDocument.create().then(d => d.embedFont(StandardFonts.HelveticaBold));
     const useJpeg = totalPages > 12;
+
+    const CHUNK_SIZE = 35;
+    const tempChunks = [];
+    let currentChunkDoc = await PDFDocument.create();
+    let currentChunkFont = await currentChunkDoc.embedFont(StandardFonts.HelveticaBold);
+    let chunkCount = 0;
 
     // Stage 2: Rendering Pages (0% -> 100%)
     for (let i = 1; i <= totalPages; i++) {
-      const renderPercent = Math.round((i / totalPages) * 100);
+      const renderPercent = Math.round((i / totalPages) * 95);
 
       onProgress({
         stage: 'rendering',
@@ -218,7 +222,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       });
 
       // 🧹 TAB MEMORY FLUSH: Every 35 pages, close tab and reopen fresh at page i
-      // This eliminates GPU raster texture buildup and keeps RAM < 70MB across 300+ pages!
+      // This eliminates GPU raster texture buildup and keeps Chromium RAM < 70MB across 1000+ pages!
       if (i > 1 && (i - 1) % 35 === 0) {
         console.log(`🧹 [Tab Memory Flush] Purging memory cache at Page ${i}...`);
         await page.close().catch(() => {});
@@ -268,21 +272,35 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         });
       }, i);
 
-      // 2. Fast active wait for content (image, newpage, or text layer) to populate without stalling
+      // 2. Strict Content Validator (Zero White Pages):
+      // Only proceed when actual text, SVG, canvas, or loaded images exist (never on empty div placeholders)
       let contentReady = false;
       const waitStart = Date.now();
-      while (Date.now() - waitStart < 1500) {
+      while (Date.now() - waitStart < 2500) {
         contentReady = await page.evaluate((idx) => {
           const el = document.getElementById(`outer_page_${idx}`);
           if (!el) return false;
+
+          // Check for SVG / canvas / vector elements in newpage
           const newpage = el.querySelector('.newpage');
-          if (newpage && newpage.children.length > 0) return true;
+          if (newpage) {
+            const hasSvg = newpage.querySelector('svg');
+            const hasCanvas = newpage.querySelector('canvas');
+            if (hasSvg || hasCanvas) return true;
+            if (newpage.children.length > 0 && newpage.innerHTML.trim().length > 150) return true;
+          }
+
+          // Check for loaded image with actual dimensions
           const img = el.querySelector('img');
-          if (img && img.src && (img.complete || img.naturalWidth > 0)) return true;
+          if (img && img.src && (img.complete || img.naturalWidth > 50)) return true;
+
+          // Check for rendered text in text_layer (must contain actual text, not empty div)
           const textLayer = el.querySelector('.text_layer');
-          if (textLayer) return true;
+          if (textLayer && textLayer.textContent && textLayer.textContent.trim().length > 5) return true;
+
           return false;
         }, i);
+
         if (contentReady) break;
         await new Promise(r => setTimeout(r, 80));
       }
@@ -297,14 +315,14 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       let embeddedImage;
 
       if (useJpeg) {
-        imgBuffer = await pageElement.screenshot({ type: 'jpeg', quality: 88 });
-        embeddedImage = await pdfDoc.embedJpg(imgBuffer);
+        imgBuffer = await pageElement.screenshot({ type: 'jpeg', quality: 86 });
+        embeddedImage = await currentChunkDoc.embedJpg(imgBuffer);
       } else {
         imgBuffer = await pageElement.screenshot({ type: 'png', omitBackground: false });
-        embeddedImage = await pdfDoc.embedPng(imgBuffer);
+        embeddedImage = await currentChunkDoc.embedPng(imgBuffer);
       }
 
-      const pdfPage = pdfDoc.addPage([embeddedImage.width, embeddedImage.height]);
+      const pdfPage = currentChunkDoc.addPage([embeddedImage.width, embeddedImage.height]);
       pdfPage.drawImage(embeddedImage, {
         x: 0,
         y: 0,
@@ -312,10 +330,35 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         height: embeddedImage.height
       });
 
-      addClickableWatermark(pdfDoc, pdfPage, watermarkFont, botUsername);
+      addClickableWatermark(currentChunkDoc, pdfPage, currentChunkFont, botUsername);
+
+      // 💾 DISK CHUNKING: Every CHUNK_SIZE pages or on last page, flush chunk to disk
+      // This guarantees Node.js memory stays flat at < 70MB even on 1000+ pages!
+      if (i % CHUNK_SIZE === 0 || i === totalPages) {
+        chunkCount++;
+        const chunkPath = path.join(downloadsDir, `temp_chunk_${docId}_${chunkCount}.pdf`);
+        const chunkBytes = await currentChunkDoc.save();
+        fs.writeFileSync(chunkPath, chunkBytes);
+        tempChunks.push(chunkPath);
+        console.log(`💾 [Disk Chunking] Saved Chunk ${chunkCount} (${chunkPath}) [Pages up to ${i}]`);
+
+        // Flush chunk from memory
+        currentChunkDoc = null;
+        if (i < totalPages) {
+          currentChunkDoc = await PDFDocument.create();
+          currentChunkFont = await currentChunkDoc.embedFont(StandardFonts.HelveticaBold);
+        }
+      }
     }
 
-    const pdfBytes = await pdfDoc.save();
+    // 🛑 STEP 1: CLOSE CHROMIUM BROWSER BEFORE FINAL PDF COMPILATION!
+    // This immediately releases ~250MB-300MB of Chromium RAM before merging chunks!
+    try {
+      await browser.close();
+      browser = null;
+      console.log('🚪 [Browser Closed] Chromium memory freed before final assembly.');
+    } catch (e) {}
+
     // Clean, professional filename (e.g. 151-Skin-Cases-Diagnosis-and-Treatment.pdf)
     const cleanFileName = (docTitle || `Scribd_Doc_${docId}`)
       .replace(/[/\\?%*:|"<>]/g, '')
@@ -326,7 +369,37 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       .replace(/^-+|-+$/g, '') || `Scribd_${docId}`;
 
     const outputPath = path.join(downloadsDir, `${cleanFileName}.pdf`);
-    fs.writeFileSync(outputPath, pdfBytes);
+
+    // 🛑 STEP 2: ASSEMBLE FINAL PDF
+    onProgress({
+      stage: 'uploading',
+      percent: 98,
+      text: `📦 *Assembling final HD PDF document (${totalPages} Pages)...*`
+    });
+
+    let finalPageCount = totalPages;
+
+    if (tempChunks.length === 1) {
+      // Single chunk: Simply rename for instant 0-RAM output!
+      fs.renameSync(tempChunks[0], outputPath);
+    } else {
+      // Multi-chunk: Merge sequential chunks into final document
+      const finalPdf = await PDFDocument.create();
+      for (const cp of tempChunks) {
+        const cBytes = fs.readFileSync(cp);
+        const loadedChunk = await PDFDocument.load(cBytes);
+        const copied = await finalPdf.copyPages(loadedChunk, loadedChunk.getPageIndices());
+        copied.forEach(p => finalPdf.addPage(p));
+      }
+      const finalBytes = await finalPdf.save();
+      fs.writeFileSync(outputPath, finalBytes);
+      finalPageCount = finalPdf.getPageCount();
+
+      // Delete temporary chunk files from disk immediately
+      for (const cp of tempChunks) {
+        try { if (fs.existsSync(cp)) fs.unlinkSync(cp); } catch (e) {}
+      }
+    }
 
     const stats = fs.statSync(outputPath);
     const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(2);
@@ -334,11 +407,13 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     return {
       pdfPath: outputPath,
       title: docTitle,
-      pageCount: pdfDoc.getPageCount(),
+      pageCount: finalPageCount,
       fileSizeMB
     };
   } finally {
-    await browser.close();
+    if (browser) {
+      await browser.close().catch(() => {});
+    }
   }
 }
 

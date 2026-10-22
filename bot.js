@@ -191,12 +191,11 @@ setInterval(cleanOldDownloads, 3 * 60 * 1000);
 function getPublicDownloadUrl(filePath) {
   const fileName = encodeURIComponent(path.basename(filePath));
   const domain = process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_STATIC_URL || process.env.PUBLIC_URL || process.env.SERVER_URL;
-  if (domain) {
+  if (domain && !domain.includes('localhost') && !domain.includes('127.0.0.1')) {
     const proto = domain.startsWith('http') ? '' : 'https://';
     return `${proto}${domain}/download/${fileName}`;
   }
-  const port = process.env.PORT || 3000;
-  return `http://localhost:${port}/download/${fileName}`;
+  return null;
 }
 
 const server = http.createServer((req, res) => {
@@ -263,12 +262,17 @@ function scheduleNext() {
 // -------------------------------------------------------------
 // Task Execution with Single Dynamic Message
 // -------------------------------------------------------------
-async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }) {
+async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta, queuedMsgId, simInterval }) {
+  // Clear queued heartbeat simulation timer if any
+  if (simInterval) {
+    clearInterval(simInterval);
+  }
+
   const startTime = Date.now();
   let statusMsg = null;
   let lastRenderedText = '';
 
-  // Reuse initial queue message if available
+  // Reuse initial dynamic message if created
   if (queuedMsgId) {
     statusMsg = { message_id: queuedMsgId };
   }
@@ -276,7 +280,7 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }
   let lastStage = '';
   let lastReportedPercent = -1;
 
-  // Throttled message editor: Steps every 5% and on stage change to strictly avoid Telegram's per-message edit lock (~25 edits max)
+  // Throttled message editor: Steps every 5% and on stage change
   const updateStatus = async (statusData, force = false) => {
     const now = Date.now();
     const percent = Math.min(100, Math.max(0, statusData.percent || 0));
@@ -346,13 +350,11 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }
   };
 
   try {
-    // Quick metadata & Cover Preview fetch
-    const meta = await fetchScribdMetadata(docId, urlSlug);
+    const meta = preMeta || await fetchScribdMetadata(docId, urlSlug);
 
-    // Send instant book cover preview if available
-    let coverMsg = null;
-    if (meta.coverUrl) {
-      coverMsg = await bot.sendPhoto(chatId, meta.coverUrl, {
+    // If cover was not sent in startDownloadTask, send it now
+    if (!preMeta && meta.coverUrl) {
+      await bot.sendPhoto(chatId, meta.coverUrl, {
         caption: `📖 *${meta.title}*\n⚡ *Connected! Starting high-speed render...*`,
         parse_mode: 'Markdown'
       }).catch(() => null);
@@ -409,6 +411,18 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }
 
       const downloadUrl = getPublicDownloadUrl(result.pdfPath);
 
+      let buttons = [];
+      let linkSection = '';
+
+      if (downloadUrl) {
+        linkSection = `🔗 *Download Link:* [Click Here to Download](${downloadUrl})\n\n`;
+        buttons.push([{ text: '📥 Download PDF (30 Min Expiry)', url: downloadUrl }]);
+      } else {
+        linkSection = 
+          `⚠️ *Notice:* Direct download service public URL is being assigned.\n` +
+          `File is saved on server. (Make sure Railway Networking domain is generated!)\n\n`;
+      }
+
       const largeFileMsg = 
         `📚 *${result.title || 'Scribd Document'}*\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
@@ -419,20 +433,17 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
         `⚠️ *Telegram 50MB Limit Exceeded!*\n` +
         `Yeh PDF 50MB se bada hai, isliye ise direct Telegram chat me nahi bheja ja sakta.\n\n` +
-        `Aap niche diye gaye *Direct Server Link* se is PDF ko download kar sakte hain:\n\n` +
-        `🔗 *Download Link:* [Click Here to Download](${downloadUrl})\n\n` +
+        `${linkSection}` +
         `⏳ *Dhyan dein:* Yeh link sirf *30 minute* ke liye valid hai. 30 minute baad file server se automatically delete kar di jayegi!\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
         `👨‍💻 *Developer:* @cryvex4`;
 
-      await bot.sendMessage(chatId, largeFileMsg, {
-        parse_mode: 'Markdown',
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '📥 Download PDF (30 Min Expiry)', url: downloadUrl }]
-          ]
-        }
-      });
+      const msgOpts = { parse_mode: 'Markdown' };
+      if (buttons.length > 0) {
+        msgOpts.reply_markup = { inline_keyboard: buttons };
+      }
+
+      await bot.sendMessage(chatId, largeFileMsg, msgOpts);
     } else {
       await bot.sendDocument(chatId, result.pdfPath, {
         caption,
@@ -469,12 +480,25 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }
         }).catch(e => console.warn('[Log Channel Send Error]:', e.message));
       } else {
         const downloadUrl = getPublicDownloadUrl(result.pdfPath);
-        await bot.sendMessage(LOG_CHANNEL_ID, logCaption, {
-          parse_mode: 'Markdown',
-          reply_markup: {
+        const logOpts = { parse_mode: 'Markdown' };
+        if (downloadUrl) {
+          logOpts.reply_markup = {
             inline_keyboard: [[{ text: '📥 Download PDF (High Speed)', url: downloadUrl }]]
-          }
-        }).catch(e => console.warn('[Log Channel Msg Error]:', e.message));
+          };
+        }
+        await bot.sendMessage(LOG_CHANNEL_ID, logCaption, logOpts).catch(e => console.warn('[Log Channel Msg Error]:', e.message));
+      }
+    }
+
+    // 🧹 Instant Disk Cleanup: Delete from server disk immediately once delivered (< 50MB)
+    if (fileSizeNum <= 49.5) {
+      try {
+        if (fs.existsSync(result.pdfPath)) {
+          fs.unlinkSync(result.pdfPath);
+          console.log(`🧹 [Instant Clean] Deleted delivered PDF from disk: ${path.basename(result.pdfPath)}`);
+        }
+      } catch (cleanErr) {
+        console.warn('File cleanup notice:', cleanErr.message);
       }
     }
 
@@ -500,7 +524,7 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, queuedMsgId }
   }
 }
 
-// Helper: Start download task or enqueue
+// Helper: Start download task or enqueue with active provisioning animation
 async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
   if (activeUsers.has(userId)) {
     return bot.sendMessage(
@@ -514,19 +538,73 @@ async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
 
   activeUsers.add(userId);
 
-  let queuedMsgId = null;
-  if (runningCount >= MAX_CONCURRENT) {
-    const queuePos = queue.length + 1;
-    const qMsg = await bot.sendMessage(
-      chatId,
-      `⏳ *Request Queue Me Hai (#${queuePos})*\n\n` +
-      `Server par ek document abhi render ho raha hai. Jaise hi wo poora hoga, aapka download *automatically* shuru ho jayega! 🚀`,
-      { parse_mode: 'Markdown' }
-    ).catch(() => null);
-    if (qMsg) queuedMsgId = qMsg.message_id;
+  // Quick metadata & Instant Cover Preview
+  const meta = await fetchScribdMetadata(docId, urlSlug);
+  if (meta.coverUrl) {
+    await bot.sendPhoto(chatId, meta.coverUrl, {
+      caption: `📖 *${meta.title}*\n⚡ *Connected! Initializing Cloud Pipeline...*`,
+      parse_mode: 'Markdown'
+    }).catch(() => null);
   }
 
-  queue.push({ chatId, userId, user, docId, urlSlug, queuedMsgId });
+  let queuedMsgId = null;
+  let simInterval = null;
+
+  if (runningCount >= MAX_CONCURRENT) {
+    // Active Provisioning UX: User sees dynamic cloud allocation, NOT a boring wait message!
+    const initText = 
+      `⚡ *INITIALIZING DOCUMENT PIPELINE*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `📖 *Document:* ${meta.title}\n` +
+      `⚙️ *Allocating Dedicated Cloud Core...*\n` +
+      `[███░░░░░░░] 25%\n` +
+      `⏳ *Status:* Pre-caching Scribd stream & structure...\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `👨‍💻 *Made by* @cryvex4`;
+
+    const qMsg = await bot.sendMessage(chatId, initText, { parse_mode: 'Markdown' }).catch(() => null);
+    if (qMsg) {
+      queuedMsgId = qMsg.message_id;
+
+      const simStages = [
+        { percent: 40, bar: '████░░░░░░', text: '🔄 Pre-loading document metadata & fonts...' },
+        { percent: 60, bar: '██████░░░░', text: '🛡️ Preparing 100% Lossless render buffer...' },
+        { percent: 80, bar: '████████░░', text: '⚡ Cloud Core synchronized! Finalizing render queue...' }
+      ];
+      let stageIdx = 0;
+      simInterval = setInterval(async () => {
+        if (stageIdx >= simStages.length) return;
+        const cur = simStages[stageIdx++];
+        const updatedSim = 
+          `⚡ *INITIALIZING DOCUMENT PIPELINE*\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `📖 *Document:* ${meta.title}\n` +
+          `⚙️ *Configuring High-Speed Worker...*\n` +
+          `[${cur.bar}] ${cur.percent}%\n` +
+          `⏳ *Status:* ${cur.text}\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `👨‍💻 *Made by* @cryvex4`;
+
+        await bot.editMessageText(updatedSim, {
+          chat_id: chatId,
+          message_id: queuedMsgId,
+          parse_mode: 'Markdown'
+        }).catch(() => {});
+      }, 3500);
+    }
+  }
+
+  queue.push({
+    chatId,
+    userId,
+    user,
+    docId,
+    urlSlug,
+    meta,
+    queuedMsgId,
+    simInterval
+  });
+
   scheduleNext();
 }
 
