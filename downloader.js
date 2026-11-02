@@ -174,15 +174,9 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
       '--disable-gpu',
-      '--disable-accelerated-2d-canvas',
-      '--disable-background-networking',
-      '--disable-extensions',
-      '--disable-component-update',
-      '--disable-default-apps',
-      '--mute-audio',
+      '--disable-blink-features=AutomationControlled',
       '--no-first-run',
       '--no-zygote',
-      '--js-flags=--max-old-space-size=512',
       '--window-size=1200,1600'
     ]
   });
@@ -192,28 +186,72 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(60000);
 
+    const isLinux = process.platform === 'linux';
+    const userAgent = isLinux
+      ? 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+      : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
     await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: 1.0 });
-    await page.setUserAgent(
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-    );
+    await page.setUserAgent(userAgent);
+    await page.setExtraHTTPHeaders({
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Sec-Ch-Ua': '"Chromium";v="131", "Google Chrome";v="131"',
+      'Sec-Ch-Ua-Mobile': '?0',
+      'Sec-Ch-Ua-Platform': isLinux ? '"Linux"' : '"Windows"'
+    });
 
     onProgress({
       stage: 'connecting',
-      percent: 60,
-      text: '🔍 *Connecting to Scribd server...*'
+      percent: 40,
+      text: '🔍 *Connecting to Scribd & verifying access...*'
     });
 
     const embedUrl = `https://www.scribd.com/embeds/${docId}/content?start_page=1&view_mode=scroll`;
-    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 50000 });
+    await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+    // 🛡️ Active Readiness & Cloudflare Turnstile Bypass Poller
+    let docReady = false;
+    const startWait = Date.now();
+    while (Date.now() - startWait < 30000) {
+      docReady = await page.evaluate(() => {
+        const title = (document.title || '').toLowerCase();
+        if (title.includes('client challenge') || title.includes('just a moment') || title.includes('attention required')) {
+          return false;
+        }
+        if (window.docManager && window.docManager.pages && Object.keys(window.docManager.pages).length > 0) {
+          return true;
+        }
+        if (document.querySelectorAll('[id^="outer_page_"]').length > 0) {
+          return true;
+        }
+        return false;
+      });
+
+      if (docReady) break;
+
+      // In case Cloudflare Turnstile has an auto-clickable checkbox in an iframe:
+      try {
+        const frames = page.frames();
+        for (const frame of frames) {
+          if (frame.url().includes('cloudflare') || frame.url().includes('turnstile') || frame.url().includes('challenge')) {
+            const box = await frame.$('input[type="checkbox"], #challenge-stage, .ctp-checkbox-label');
+            if (box) await box.click().catch(() => {});
+          }
+        }
+      } catch (e) {}
+
+      await new Promise(r => setTimeout(r, 1200));
+    }
+
+    if (!docReady) {
+      throw new Error(`Scribd protection blocked access or document not found. Please retry.`);
+    }
 
     onProgress({
       stage: 'connecting',
       percent: 100,
       text: '✅ *Connected! Initializing document structure...*'
     });
-
-    // Wait 3 seconds for Scribd docManager to initialize
-    await new Promise(r => setTimeout(r, 3000));
 
     // Extract real title (Filter out bot challenge titles like 'Client Challenge')
     let docTitle = preferredTitle;
@@ -289,6 +327,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     let currentChunkDoc = await PDFDocument.create();
     let currentChunkFont = await currentChunkDoc.embedFont(StandardFonts.HelveticaBold);
     let chunkCount = 0;
+    let totalPagesCaptured = 0;
 
     // Stage 2: Rendering Pages (0% -> 100%)
     for (let i = 1; i <= totalPages; i++) {
@@ -415,15 +454,18 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       });
 
       addClickableWatermark(currentChunkDoc, pdfPage, currentChunkFont, botUsername);
+      totalPagesCaptured++;
 
       // 💾 DISK CHUNKING: Save chunk every CHUNK_SIZE pages
       if (i % CHUNK_SIZE === 0 || i === totalPages) {
-        chunkCount++;
-        const chunkPath = path.join(downloadsDir, `temp_chunk_${docId}_${chunkCount}.pdf`);
-        const chunkBytes = await currentChunkDoc.save();
-        fs.writeFileSync(chunkPath, chunkBytes);
-        tempChunks.push(chunkPath);
-        console.log(`💾 [Disk Chunking] Saved Chunk ${chunkCount} [Pages up to ${i}]`);
+        if (currentChunkDoc.getPageCount() > 0) {
+          chunkCount++;
+          const chunkPath = path.join(downloadsDir, `temp_chunk_${docId}_${chunkCount}.pdf`);
+          const chunkBytes = await currentChunkDoc.save();
+          fs.writeFileSync(chunkPath, chunkBytes);
+          tempChunks.push(chunkPath);
+          console.log(`💾 [Disk Chunking] Saved Chunk ${chunkCount} [Pages up to ${i}]`);
+        }
 
         currentChunkDoc = null;
         if (i < totalPages) {
@@ -431,6 +473,10 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
           currentChunkFont = await currentChunkDoc.embedFont(StandardFonts.HelveticaBold);
         }
       }
+    }
+
+    if (totalPagesCaptured === 0 || tempChunks.length === 0) {
+      throw new Error(`Could not capture any pages from Scribd document. Document may be restricted or blocked by protection.`);
     }
 
     // Close Chromium before assembling final PDF to release RAM
