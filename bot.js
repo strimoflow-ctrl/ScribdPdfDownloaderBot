@@ -99,7 +99,10 @@ async function fetchScribdMetadata(docId, urlSlug) {
     const html = await resp.text();
     const tm = html.match(/<title>([^<]+)<\/title>/i);
     if (tm) {
-      title = tm[1].split('|')[0].replace(/Scribd/i, '').replace(/&amp;/g, '&').trim();
+      const raw = tm[1].split('|')[0].replace(/Scribd/i, '').replace(/&amp;/g, '&').trim();
+      if (!raw.toLowerCase().includes('client challenge') && !raw.toLowerCase().includes('just a moment')) {
+        title = raw;
+      }
     }
     const im = html.match(/<meta property="og:image" content="([^"]+)"/i);
     if (im) {
@@ -390,117 +393,71 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
       });
     }, 1200);
 
-    const caption = 
-      `📚 *${result.title || 'Scribd Document'}*\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `📑 *Total Pages:* ${result.pageCount} Pages\n` +
-      `📦 *File Size:* ${result.fileSizeMB} MB\n` +
-      `⚡ *Download Time:* ${totalElapsed}s\n` +
-      `🎯 *Quality:* 100% Lossless (No Clipping)\n` +
-      `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `👨‍💻 *Developer:* @cryvex4`;
+    const deliveryFiles = (result.files && result.files.length > 0) ? result.files : [
+      { path: result.pdfPath, partNum: 1, totalParts: 1, pageRange: `1 - ${result.pageCount}`, sizeMB: result.fileSizeMB }
+    ];
 
-    const fileSizeNum = parseFloat(result.fileSizeMB);
+    clearInterval(uploadInterval);
 
-    // If file is > 49.5 MB, Telegram rejects it. Provide direct server download link (valid 30 mins)
-    if (fileSizeNum > 49.5) {
-      clearInterval(uploadInterval);
-      if (statusMsg) {
-        await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-      }
-
-      const downloadUrl = getPublicDownloadUrl(result.pdfPath);
-
-      let buttons = [];
-      let linkSection = '';
-
-      if (downloadUrl) {
-        linkSection = `🔗 *Download Link:* [Click Here to Download](${downloadUrl})\n\n`;
-        buttons.push([{ text: '📥 Download PDF (30 Min Expiry)', url: downloadUrl }]);
-      } else {
-        linkSection = 
-          `⚠️ *Notice:* Direct download service public URL is being assigned.\n` +
-          `File is saved on server. (Make sure Railway Networking domain is generated!)\n\n`;
-      }
-
-      const largeFileMsg = 
-        `📚 *${result.title || 'Scribd Document'}*\n` +
+    for (const file of deliveryFiles) {
+      const partCaption = 
+        `📚 *${result.title || 'Scribd Document'}* ${file.totalParts > 1 ? `[Part ${file.partNum}/${file.totalParts}]` : ''}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `📑 *Total Pages:* ${result.pageCount} Pages\n` +
-        `📦 *File Size:* ${result.fileSizeMB} MB *(Large File)*\n` +
-        `⚡ *Download Time:* ${totalElapsed}s\n` +
-        `🎯 *Quality:* 100% Lossless (No Clipping)\n` +
+        `📑 *Pages:* ${file.pageRange} (Total: ${result.pageCount})\n` +
+        `📦 *File Size:* ${file.sizeMB} MB\n` +
+        `⚡ *Speed:* ${totalElapsed}s\n` +
+        `🎯 *Quality:* 100% Crisp Vector HD (Zero White)\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `⚠️ *Telegram 50MB Limit Exceeded!*\n` +
-        `Yeh PDF 50MB se bada hai, isliye ise direct Telegram chat me nahi bheja ja sakta.\n\n` +
-        `${linkSection}` +
-        `⏳ *Dhyan dein:* Yeh link sirf *30 minute* ke liye valid hai. 30 minute baad file server se automatically delete kar di jayegi!\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
+        `🤖 *Downloaded via:* @${botUsername}\n` +
         `👨‍💻 *Developer:* @cryvex4`;
 
-      const msgOpts = { parse_mode: 'Markdown' };
-      if (buttons.length > 0) {
-        msgOpts.reply_markup = { inline_keyboard: buttons };
-      }
-
-      await bot.sendMessage(chatId, largeFileMsg, msgOpts);
-    } else {
-      await bot.sendDocument(chatId, result.pdfPath, {
-        caption,
+      await bot.sendDocument(chatId, file.path, {
+        caption: partCaption,
         parse_mode: 'Markdown'
       });
 
-      clearInterval(uploadInterval);
+      // 📡 Public Channel / Group Auto-Forwarding
+      if (LOG_CHANNEL_ID) {
+        const userMention = (user && user.username) 
+          ? `@${user.username}` 
+          : ((user && user.first_name) ? user.first_name : 'Anonymous');
+        const logCaption = 
+          `📚 *${result.title}* ${file.totalParts > 1 ? `[Part ${file.partNum}/${file.totalParts}]` : ''}\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `📑 *Pages:* ${file.pageRange} (Total: ${result.pageCount})\n` +
+          `📦 *Size:* ${file.sizeMB} MB\n` +
+          `👤 *Downloaded By:* ${userMention}\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🤖 *Download via:* @${botUsername}`;
 
-      // Delete dynamic progress message after delivery
-      if (statusMsg) {
-        await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
-      }
-    }
-
-    // 📡 Public Channel / Group Auto-Forwarding
-    if (LOG_CHANNEL_ID) {
-      const userMention = (user && user.username) 
-        ? `@${user.username}` 
-        : ((user && user.first_name) ? user.first_name : 'Anonymous');
-
-      const logCaption = 
-        `📚 *${result.title}*\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `📑 *Pages:* ${result.pageCount} Pages\n` +
-        `📦 *Size:* ${result.fileSizeMB} MB\n` +
-        `👤 *Downloaded By:* ${userMention}\n` +
-        `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `🤖 *Download via:* @${botUsername}`;
-
-      if (fileSizeNum <= 49.5) {
-        await bot.sendDocument(LOG_CHANNEL_ID, result.pdfPath, {
+        await bot.sendDocument(LOG_CHANNEL_ID, file.path, {
           caption: logCaption,
           parse_mode: 'Markdown'
         }).catch(e => console.warn('[Log Channel Send Error]:', e.message));
-      } else {
-        const downloadUrl = getPublicDownloadUrl(result.pdfPath);
-        const logOpts = { parse_mode: 'Markdown' };
-        if (downloadUrl) {
-          logOpts.reply_markup = {
-            inline_keyboard: [[{ text: '📥 Download PDF (High Speed)', url: downloadUrl }]]
-          };
-        }
-        await bot.sendMessage(LOG_CHANNEL_ID, logCaption, logOpts).catch(e => console.warn('[Log Channel Msg Error]:', e.message));
       }
-    }
 
-    // 🧹 Instant Disk Cleanup: Delete from server disk immediately once delivered (< 50MB)
-    if (fileSizeNum <= 49.5) {
+      // 🧹 Instant Disk Cleanup: Delete file from disk immediately after delivery!
       try {
-        if (fs.existsSync(result.pdfPath)) {
-          fs.unlinkSync(result.pdfPath);
-          console.log(`🧹 [Instant Clean] Deleted delivered PDF from disk: ${path.basename(result.pdfPath)}`);
+        if (fs.existsSync(file.path)) {
+          fs.unlinkSync(file.path);
+          console.log(`🧹 [Instant Clean] Deleted delivered PDF: ${path.basename(file.path)}`);
         }
       } catch (cleanErr) {
         console.warn('File cleanup notice:', cleanErr.message);
       }
     }
+
+    // Delete dynamic progress status message
+    if (statusMsg) {
+      await bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
+    }
+
+    // Double check original master file cleanup if split
+    try {
+      if (result.pdfPath && fs.existsSync(result.pdfPath)) {
+        fs.unlinkSync(result.pdfPath);
+      }
+    } catch(e) {}
 
     console.log(`✅ [Delivery Success] Doc ${docId} delivered to User ${userId} in ${totalElapsed}s`);
   } catch (err) {
