@@ -222,7 +222,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(60000);
 
-    await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: 1.0 });
+    await page.setViewport({ width: 1250, height: 2200, deviceScaleFactor: 1.0 });
     await page.setUserAgent(
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     );
@@ -313,7 +313,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       targetJpegQuality = 78;
     }
 
-    await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: targetDeviceScale });
+    await page.setViewport({ width: 1250, height: 2200, deviceScaleFactor: targetDeviceScale });
 
     const CHUNK_SIZE = 35;
     let currentChunkDoc = await PDFDocument.create();
@@ -344,7 +344,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         }
         page.setDefaultNavigationTimeout(60000);
         page.setDefaultTimeout(60000);
-        await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: targetDeviceScale });
+        await page.setViewport({ width: 1250, height: 2200, deviceScaleFactor: targetDeviceScale });
         await page.setUserAgent(
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
         );
@@ -379,10 +379,10 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         const el = document.getElementById(`outer_page_${idx}`);
         if (el) {
           if (scroller !== window) {
-            scroller.scrollTop = Math.max(0, el.offsetTop - 20);
+            scroller.scrollTop = el.offsetTop;
             scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
           }
-          el.scrollIntoView({ behavior: 'instant', block: 'center' });
+          el.scrollIntoView({ behavior: 'instant', block: 'start' });
         }
       }, i);
 
@@ -390,7 +390,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       // Actively wait until page assets (innerPageElem, images, svg, text) are truly ready
       let contentReady = false;
       const waitStart = Date.now();
-      while (Date.now() - waitStart < 5000) {
+      while (Date.now() - waitStart < 7000) {
         contentReady = await page.evaluate((idx) => {
           const mgr = window.docManager;
           if (mgr && mgr.pages && mgr.pages[idx]) {
@@ -399,6 +399,10 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
               try { p.display(); } catch (e) {}
               try { p.turnOnImages(); } catch (e) {}
               if (p.innerPageElem.children.length > 0 || p.innerPageElem.innerHTML.length > 50) {
+                const innerImg = p.innerPageElem.querySelector('img');
+                if (innerImg && (!innerImg.complete || innerImg.naturalWidth === 0)) {
+                  return false;
+                }
                 return true;
               }
             }
@@ -408,7 +412,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
           if (!el) return false;
 
           const img = el.querySelector('img');
-          if (img && img.src && (img.complete || img.naturalWidth > 20)) return true;
+          if (img && img.src && img.complete && img.naturalWidth > 20) return true;
 
           const canvas = el.querySelector('canvas');
           if (canvas) return true;
@@ -430,15 +434,15 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         if (contentReady) break;
 
         // Human-like scroll jiggle to trigger lazy-load intersection observers
-        if (Date.now() - waitStart > 1200) {
+        if (Date.now() - waitStart > 1000) {
           await page.evaluate((idx) => {
             const scroller = document.querySelector('.document_scroller') || window;
             const el = document.getElementById(`outer_page_${idx}`);
             if (el && scroller !== window) {
-              scroller.scrollTop = el.offsetTop + 30;
+              scroller.scrollTop = el.offsetTop + 40;
               scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
               setTimeout(() => {
-                scroller.scrollTop = Math.max(0, el.offsetTop - 20);
+                scroller.scrollTop = el.offsetTop;
                 scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
               }, 40);
             }
@@ -449,11 +453,11 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
           }, i);
         }
 
-        await new Promise(r => setTimeout(r, 100));
+        await new Promise(r => setTimeout(r, 120));
       }
 
-      // Small 150ms settling delay after content is ready to ensure full render before snapshot
-      await new Promise(r => setTimeout(r, 150));
+      // Settling delay after content is ready to ensure full render paint before snapshot
+      await new Promise(r => setTimeout(r, 400));
 
       const pageElement = await page.$(`#outer_page_${i}`);
       if (!pageElement) {
