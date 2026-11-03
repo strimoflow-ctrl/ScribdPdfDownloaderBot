@@ -311,13 +311,51 @@ const activeUsers = new Set();
 // On Railway Free Tier (512MB RAM), MAX_CONCURRENT=1 guarantees ZERO crashes
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT || '1', 10);
 let runningCount = 0;
+let currentRunningTask = null;
 const queue = [];
+
+// -------------------------------------------------------------
+// Strict Anti-Duplicate System (Debounce & Task Guard)
+// -------------------------------------------------------------
+const recentlyProcessed = new Map();
+function isDuplicateRequest(key, windowMs = 4000) {
+  const now = Date.now();
+  if (recentlyProcessed.has(key)) {
+    const prev = recentlyProcessed.get(key);
+    if (now - prev < windowMs) {
+      return true;
+    }
+  }
+  recentlyProcessed.set(key, now);
+  if (recentlyProcessed.size > 200) {
+    for (const [k, ts] of recentlyProcessed.entries()) {
+      if (now - ts > 60000) recentlyProcessed.delete(k);
+    }
+  }
+  return false;
+}
+
+function isAlreadyQueuedOrRunning(docId, partNum, chatId) {
+  if (
+    currentRunningTask &&
+    currentRunningTask.chatId === chatId &&
+    currentRunningTask.docId === docId &&
+    (currentRunningTask.options?.partNum === partNum || (!partNum && !currentRunningTask.options?.partNum))
+  ) {
+    return true;
+  }
+  return queue.some(
+    t => t.chatId === chatId && t.docId === docId && (t.options?.partNum === partNum || (!partNum && !t.options?.partNum))
+  );
+}
 
 function scheduleNext() {
   if (runningCount >= MAX_CONCURRENT || queue.length === 0) return;
   const task = queue.shift();
   runningCount++;
+  currentRunningTask = task;
   executeTask(task).finally(() => {
+    currentRunningTask = null;
     runningCount--;
     scheduleNext();
   });
@@ -609,6 +647,13 @@ async function startDownloadTask(chatId, userId, user, docId, urlSlug, options =
     }
   }
 
+  // 2. ANTI-DUPLICATE QUEUE CHECK
+  const taskPartNum = options.partNum || null;
+  if (isAlreadyQueuedOrRunning(docId, taskPartNum, chatId)) {
+    console.log(`⚠️ [Anti-Duplicate] Blocked duplicate queue request for Doc ${docId} (Part: ${taskPartNum})`);
+    return;
+  }
+
   if (activeUsers.has(userId)) {
     return bot.sendMessage(
       chatId,
@@ -737,6 +782,10 @@ bot.on('callback_query', async (query) => {
   // Multi-Part Button Handler (with Instant Cache & Busy Alerts)
   // -------------------------------------------------------------
   if (data && data.startsWith('part:')) {
+    if (isDuplicateRequest(`cb:${userId}:${data}`, 3500)) {
+      return bot.answerCallbackQuery(query.id, { text: '⏳ Kripya wait karein, request process ho rahi hai...' });
+    }
+
     // Format: part:docId:start:end:partNum:totalParts
     const [, docId, startStr, endStr, partNumStr, totalPartsStr] = data.split(':');
     const startPage = parseInt(startStr, 10);
@@ -862,6 +911,12 @@ bot.on('message', async (msg) => {
       `👨‍💻 *Support:* @cryvex4`,
       { parse_mode: 'Markdown' }
     );
+  }
+
+  // 🔒 Anti-Duplicate Guard: Prevents double-send if link is sent twice within 4s
+  if (isDuplicateRequest(`link:${chatId}:${info.docId}`, 4000)) {
+    console.log(`⚠️ [Anti-Duplicate] Blocked duplicate link submission: ${info.docId}`);
+    return;
   }
 
   // 🔒 Real-time Force Subscribe Check on every link
