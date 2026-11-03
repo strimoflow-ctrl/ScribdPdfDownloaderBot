@@ -416,25 +416,7 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
         parse_mode: 'Markdown'
       });
 
-      // 📡 Public Channel / Group Auto-Forwarding
-      if (LOG_CHANNEL_ID) {
-        const userMention = (user && user.username) 
-          ? `@${user.username}` 
-          : ((user && user.first_name) ? user.first_name : 'Anonymous');
-        const logCaption = 
-          `📚 *${result.title}* ${file.totalParts > 1 ? `[Part ${file.partNum}/${file.totalParts}]` : ''}\n` +
-          `━━━━━━━━━━━━━━━━━━━━━━\n` +
-          `📑 *Pages:* ${file.pageRange} (Total: ${result.pageCount})\n` +
-          `📦 *Size:* ${file.sizeMB} MB\n` +
-          `👤 *Downloaded By:* ${userMention}\n` +
-          `━━━━━━━━━━━━━━━━━━━━━━\n` +
-          `🤖 *Download via:* @${botUsername}`;
-
-        await bot.sendDocument(LOG_CHANNEL_ID, file.path, {
-          caption: logCaption,
-          parse_mode: 'Markdown'
-        }).catch(e => console.warn('[Log Channel Send Error]:', e.message));
-      }
+      
 
       // 🧹 Instant Disk Cleanup: Delete file from disk immediately after delivery!
       try {
