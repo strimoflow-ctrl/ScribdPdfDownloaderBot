@@ -4,6 +4,7 @@ const path = require('path');
 const http = require('http');
 const dotenv = require('dotenv');
 const { downloadScribdDocument } = require('./downloader');
+const { cacheManager } = require('./cache');
 
 // Load environment variables
 dotenv.config();
@@ -148,6 +149,61 @@ async function sendJoinPrompt(chatId, docId = null, urlSlug = null) {
   });
 }
 
+// -------------------------------------------------------------
+// Sleek Multi-Part Selection Buttons for Large Documents (>300 Pages)
+// -------------------------------------------------------------
+function sendPartButtonsMessage(chatId, docId, title, totalPages, totalParts, partSize = 250, editMsgId = null) {
+  const inlineButtons = [];
+  let currentRow = [];
+
+  for (let p = 1; p <= totalParts; p++) {
+    const start = ((p - 1) * partSize) + 1;
+    const end = Math.min(totalPages, p * partSize);
+    const rangeKey = `${start}-${end}`;
+    const isCached = cacheManager.getPartFileId(docId, rangeKey);
+    const label = isCached
+      ? `⚡ Part ${p} (${start}-${end})`
+      : `📥 Part ${p} (${start}-${end})`;
+
+    currentRow.push({
+      text: label,
+      callback_data: `part:${docId}:${start}:${end}:${p}:${totalParts}`
+    });
+
+    if (currentRow.length === 2 || p === totalParts) {
+      inlineButtons.push(currentRow);
+      currentRow = [];
+    }
+  }
+
+  const text =
+    `📚 *BADA DOCUMENT DETECTED (MULTI-PART SYSTEM)*\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━\n` +
+    `📖 *Title:* ${title}\n` +
+    `📄 *Total Pages:* ${totalPages} Pages\n` +
+    `📦 *Total Parts:* ${totalParts} Parts (Har part ~${partSize} Pages)\n\n` +
+    `⚠️ *Dhyan dein:* Server crash na ho aur HD quality mile, isliye is document ko *${totalParts} Parts* me divide kiya gaya hai.\n\n` +
+    `👇 *Apna Part download karne ke liye niche button par click karein:*`;
+
+  const keyboard = { inline_keyboard: inlineButtons };
+
+  if (editMsgId) {
+    return bot.editMessageText(text, {
+      chat_id: chatId,
+      message_id: editMsgId,
+      parse_mode: 'Markdown',
+      reply_markup: keyboard
+    }).catch(() => {
+      return bot.sendMessage(chatId, text, { parse_mode: 'Markdown', reply_markup: keyboard });
+    });
+  }
+
+  return bot.sendMessage(chatId, text, {
+    parse_mode: 'Markdown',
+    reply_markup: keyboard
+  });
+}
+
 // Generate sleek Unicode progress bar: [████░░░░░░]
 function getProgressBar(percent) {
   const total = 10;
@@ -162,27 +218,32 @@ function formatSeconds(sec) {
 }
 
 // -------------------------------------------------------------
-// Auto-deletion: Keep PDFs for 30 minutes, then automatically remove
+// Auto-deletion: Keep PDFs for 10 minutes, then automatically remove & clean /tmp
 // -------------------------------------------------------------
-const THIRTY_MINUTES_MS = 30 * 60 * 1000;
+const TEN_MINUTES_MS = 10 * 60 * 1000;
 function cleanOldDownloads() {
   const downloadsDir = path.join(__dirname, 'downloads');
-  if (!fs.existsSync(downloadsDir)) return;
-  const now = Date.now();
-  fs.readdir(downloadsDir, (err, files) => {
-    if (err) return;
-    for (const file of files) {
-      if (!file.endsWith('.pdf')) continue;
-      const filePath = path.join(downloadsDir, file);
-      fs.stat(filePath, (err, stats) => {
-        if (!err && (now - stats.mtimeMs) > THIRTY_MINUTES_MS) {
-          fs.unlink(filePath, () => {
-            console.log(`🧹 [30m Expiry] Deleted old PDF cache: ${file}`);
-          });
-        }
-      });
-    }
-  });
+  if (fs.existsSync(downloadsDir)) {
+    const now = Date.now();
+    fs.readdir(downloadsDir, (err, files) => {
+      if (err) return;
+      for (const file of files) {
+        if (!file.endsWith('.pdf')) continue;
+        const filePath = path.join(downloadsDir, file);
+        fs.stat(filePath, (err, stats) => {
+          if (!err && (now - stats.mtimeMs) > TEN_MINUTES_MS) {
+            fs.unlink(filePath, () => {
+              console.log(`🧹 [Disk Expiry] Deleted old PDF: ${file}`);
+            });
+          }
+        });
+      }
+    });
+  }
+  // Clean lingering /tmp Chromium profiles
+  try {
+    cacheManager.cleanSystemTemp();
+  } catch (e) {}
 }
 // Run cleaner at startup and every 3 minutes
 cleanOldDownloads();
@@ -265,7 +326,7 @@ function scheduleNext() {
 // -------------------------------------------------------------
 // Task Execution with Single Dynamic Message
 // -------------------------------------------------------------
-async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta, queuedMsgId, simInterval }) {
+async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta, queuedMsgId, simInterval, options = {} }) {
   // Clear queued heartbeat simulation timer if any
   if (simInterval) {
     clearInterval(simInterval);
@@ -309,7 +370,7 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
         `[${bar}] ${percent}%\n` +
         `⏳ *Time:* ${formatSeconds(elapsed)}`;
     } else if (statusData.stage === 'rendering') {
-      stageHeader = '⚡ *RENDERING HD PAGES*';
+      stageHeader = options.partNum ? `⚡ *RENDERING PART ${options.partNum}/${options.totalParts}*` : '⚡ *RENDERING HD PAGES*';
       bodyText = 
         `${statusData.text || 'Rendering pages...'}\n` +
         `[${bar}] ${percent}%\n` +
@@ -355,8 +416,8 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
   try {
     const meta = preMeta || await fetchScribdMetadata(docId, urlSlug);
 
-    // If cover was not sent in startDownloadTask, send it now
-    if (!preMeta && meta.coverUrl) {
+    // If cover was not sent in startDownloadTask, send it now (only for full docs)
+    if (!preMeta && meta.coverUrl && !options.isPart) {
       await bot.sendPhoto(chatId, meta.coverUrl, {
         caption: `📖 *${meta.title}*\n⚡ *Connected! Starting high-speed render...*`,
         parse_mode: 'Markdown'
@@ -367,12 +428,19 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
     await updateStatus({
       stage: 'connecting',
       percent: 15,
-      text: `🚀 *Opening:* ${meta.title}`
+      text: `🚀 *Opening:* ${meta.title || 'Document'}`
     }, true);
 
     const result = await downloadScribdDocument(docId, async (progress) => {
       await updateStatus(progress);
-    }, botUsername, meta.title);
+    }, botUsername, meta.title, options);
+
+    // ⚡ SMART MULTI-PART DETECTION: If document has > 300 pages and needs part selection
+    if (result && result.isMultiPart) {
+      cacheManager.saveDocMeta(docId, result.title, result.totalPages, result.totalParts, result.partSize);
+      await sendPartButtonsMessage(chatId, docId, result.title, result.totalPages, result.totalParts, result.partSize, statusMsg ? statusMsg.message_id : null);
+      return;
+    }
 
     const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
 
@@ -401,9 +469,9 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
 
     for (const file of deliveryFiles) {
       const partCaption = 
-        `📚 *${result.title || 'Scribd Document'}* ${file.totalParts > 1 ? `[Part ${file.partNum}/${file.totalParts}]` : ''}\n` +
+        `📚 *${result.title || 'Scribd Document'}* ${options.partNum ? `[Part ${options.partNum}/${options.totalParts}]` : (file.totalParts > 1 ? `[Part ${file.partNum}/${file.totalParts}]` : '')}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `📑 *Pages:* ${file.pageRange} (Total: ${result.pageCount})\n` +
+        `📑 *Pages:* ${result.pageRange || file.pageRange} (Part Pages: ${result.pageCount})\n` +
         `📦 *File Size:* ${file.sizeMB} MB\n` +
         `⚡ *Speed:* ${totalElapsed}s\n` +
         `🎯 *Quality:* 100% Crisp Vector HD (Zero White)\n` +
@@ -411,12 +479,26 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
         `🤖 *Downloaded via:* @${botUsername}\n` +
         `👨‍💻 *Developer:* @cryvex4`;
 
-      await bot.sendDocument(chatId, file.path, {
+      const sentMsg = await bot.sendDocument(chatId, file.path, {
         caption: partCaption,
         parse_mode: 'Markdown'
       });
 
-      
+      // 💾 Smart Cache: Save Telegram file_id for instant zero-disk deliveries in future!
+      const fileId = sentMsg?.document?.file_id;
+      if (fileId) {
+        if (options && options.isPart) {
+          const rangeKey = `${options.startPage}-${options.endPage}`;
+          cacheManager.savePartFileId(docId, rangeKey, fileId, {
+            title: result.title,
+            totalPages: result.totalPages || options.endPage,
+            totalParts: options.totalParts,
+            partSize: 250
+          });
+        } else {
+          cacheManager.saveFullFileId(docId, fileId, result.title, result.pageCount);
+        }
+      }
 
       // 🧹 Instant Disk Cleanup: Delete file from disk immediately after delivery!
       try {
@@ -442,6 +524,20 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
     } catch(e) {}
 
     console.log(`✅ [Delivery Success] Doc ${docId} delivered to User ${userId} in ${totalElapsed}s`);
+
+    // If this was a multi-part download, notify user that they can grab the next part now!
+    if (options && options.isPart) {
+      const nextPart = options.partNum + 1;
+      const nextTxt = nextPart <= options.totalParts
+        ? `Ab aap upar diye gaye buttons me se *Part ${nextPart}* par click karke agla part download kar sakte hain! 🚀`
+        : `🎉 Badhaai ho! Aapke sabhi parts complete ho gaye hain! ✨`;
+
+      await bot.sendMessage(
+        chatId,
+        `✅ *Part ${options.partNum} of ${options.totalParts} Delivered!*\n\n${nextTxt}`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    }
   } catch (err) {
     console.error(`❌ [Download Error] Doc ${docId}:`, err);
     if (statusMsg) {
@@ -458,13 +554,61 @@ async function executeTask({ chatId, userId, user, docId, urlSlug, meta: preMeta
       ).catch(() => {});
     }
   } finally {
+    // 🧹 Purge system temporary Chromium directories from /tmp
+    try {
+      cacheManager.cleanSystemTemp();
+    } catch (e) {}
     // Release user lock
     activeUsers.delete(userId);
   }
 }
 
 // Helper: Start download task or enqueue with active provisioning animation
-async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
+async function startDownloadTask(chatId, userId, user, docId, urlSlug, options = {}) {
+  // 1. SMART CACHE CHECK (Instant 0.5s delivery if already processed before)
+  if (!options.isPart) {
+    const fullFileId = cacheManager.getFullFileId(docId);
+    if (fullFileId) {
+      const docMeta = cacheManager.getDoc(docId) || {};
+      console.log(`⚡ [Cache Hit] Serving full document ${docId} instantly via file_id`);
+      return bot.sendDocument(chatId, fullFileId, {
+        caption:
+          `📚 *${docMeta.title || 'Scribd Document'}*\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `📑 *Pages:* ${docMeta.totalPages || 'Full'}\n` +
+          `⚡ *Delivered instantly via High-Speed Cloud Cache!* (0.5s)\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🤖 *Downloaded via:* @${botUsername}\n` +
+          `👨‍💻 *Developer:* @cryvex4`,
+        parse_mode: 'Markdown'
+      });
+    }
+
+    const knownDoc = cacheManager.getDoc(docId);
+    if (knownDoc && knownDoc.totalParts > 1) {
+      console.log(`⚡ [Cache Hit] Multi-part blueprint for ${docId} found in cache. Showing buttons immediately.`);
+      return sendPartButtonsMessage(chatId, docId, knownDoc.title, knownDoc.totalPages, knownDoc.totalParts, knownDoc.partSize);
+    }
+  } else {
+    const rangeKey = `${options.startPage}-${options.endPage}`;
+    const cachedPartFileId = cacheManager.getPartFileId(docId, rangeKey);
+    if (cachedPartFileId) {
+      console.log(`⚡ [Cache Hit] Serving Part ${options.partNum} of ${docId} instantly via file_id`);
+      const docMeta = cacheManager.getDoc(docId) || {};
+      return bot.sendDocument(chatId, cachedPartFileId, {
+        caption:
+          `📚 *${options.title || docMeta.title || 'Scribd Document'}* [Part ${options.partNum}/${options.totalParts}]\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `📑 *Pages:* ${options.startPage} - ${options.endPage} (Total: ${docMeta.totalPages || 'Full'})\n` +
+          `⚡ *Delivered instantly via High-Speed Cloud Cache!* (0.5s)\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🤖 *Downloaded via:* @${botUsername}\n` +
+          `👨‍💻 *Developer:* @cryvex4`,
+        parse_mode: 'Markdown'
+      });
+    }
+  }
+
   if (activeUsers.has(userId)) {
     return bot.sendMessage(
       chatId,
@@ -477,24 +621,27 @@ async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
 
   activeUsers.add(userId);
 
-  // Quick metadata & Instant Cover Preview
-  const meta = await fetchScribdMetadata(docId, urlSlug);
-  if (meta.coverUrl) {
-    await bot.sendPhoto(chatId, meta.coverUrl, {
-      caption: `📖 *${meta.title}*\n⚡ *Connected! Initializing Cloud Pipeline...*`,
-      parse_mode: 'Markdown'
-    }).catch(() => null);
+  // Quick metadata & Instant Cover Preview (only if not a part request)
+  let meta = options.title ? { title: options.title } : null;
+  if (!options.isPart) {
+    meta = await fetchScribdMetadata(docId, urlSlug);
+    if (meta.coverUrl) {
+      await bot.sendPhoto(chatId, meta.coverUrl, {
+        caption: `📖 *${meta.title}*\n⚡ *Connected! Initializing Cloud Pipeline...*`,
+        parse_mode: 'Markdown'
+      }).catch(() => null);
+    }
   }
 
   let queuedMsgId = null;
   let simInterval = null;
 
   if (runningCount >= MAX_CONCURRENT) {
-    // Active Provisioning UX: User sees dynamic cloud allocation, NOT a boring wait message!
+    const docTitle = (meta && meta.title) || options.title || 'Document';
     const initText = 
       `⚡ *INITIALIZING DOCUMENT PIPELINE*\n` +
       `━━━━━━━━━━━━━━━━━━━━━━\n` +
-      `📖 *Document:* ${meta.title}\n` +
+      `📖 *Document:* ${docTitle} ${options.partNum ? `[Part ${options.partNum}/${options.totalParts}]` : ''}\n` +
       `⚙️ *Allocating Dedicated Cloud Core...*\n` +
       `[███░░░░░░░] 25%\n` +
       `⏳ *Status:* Pre-caching Scribd stream & structure...\n` +
@@ -517,7 +664,7 @@ async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
         const updatedSim = 
           `⚡ *INITIALIZING DOCUMENT PIPELINE*\n` +
           `━━━━━━━━━━━━━━━━━━━━━━\n` +
-          `📖 *Document:* ${meta.title}\n` +
+          `📖 *Document:* ${docTitle}\n` +
           `⚙️ *Configuring High-Speed Worker...*\n` +
           `[${cur.bar}] ${cur.percent}%\n` +
           `⏳ *Status:* ${cur.text}\n` +
@@ -541,7 +688,8 @@ async function startDownloadTask(chatId, userId, user, docId, urlSlug) {
     urlSlug,
     meta,
     queuedMsgId,
-    simInterval
+    simInterval,
+    options
   });
 
   scheduleNext();
@@ -583,6 +731,63 @@ bot.on('callback_query', async (query) => {
         { parse_mode: 'Markdown' }
       );
     }
+  }
+
+  // -------------------------------------------------------------
+  // Multi-Part Button Handler (with Instant Cache & Busy Alerts)
+  // -------------------------------------------------------------
+  if (data && data.startsWith('part:')) {
+    // Format: part:docId:start:end:partNum:totalParts
+    const [, docId, startStr, endStr, partNumStr, totalPartsStr] = data.split(':');
+    const startPage = parseInt(startStr, 10);
+    const endPage = parseInt(endStr, 10);
+    const partNum = parseInt(partNumStr, 10);
+    const totalParts = parseInt(totalPartsStr, 10);
+
+    // 🔒 1. BUSY PROTECTION: If user already has an active task running
+    if (activeUsers.has(userId)) {
+      return bot.answerCallbackQuery(query.id, {
+        text: '⏳ Kripya wait karein! Aapka pehla part abhi render ho raha hai. Wo complete hote hi aap agla part download kar sakte hain.',
+        show_alert: true
+      });
+    }
+
+    // ⚡ 2. SMART CACHE CHECK: If this part was already uploaded previously
+    const rangeKey = `${startPage}-${endPage}`;
+    const cachedFileId = cacheManager.getPartFileId(docId, rangeKey);
+    if (cachedFileId) {
+      await bot.answerCallbackQuery(query.id, {
+        text: `⚡ Part ${partNum} cache me available hai! Instant sending...`
+      });
+      const docMeta = cacheManager.getDoc(docId) || {};
+      await bot.sendDocument(chatId, cachedFileId, {
+        caption:
+          `📚 *${docMeta.title || 'Scribd Document'}* [Part ${partNum}/${totalParts}]\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `📑 *Pages:* ${startPage} - ${endPage} (Total: ${docMeta.totalPages || 'Full'})\n` +
+          `⚡ *Delivered instantly via High-Speed Cloud Cache!* (0.5s)\n` +
+          `━━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🤖 *Downloaded via:* @${botUsername}\n` +
+          `👨‍💻 *Developer:* @cryvex4`,
+        parse_mode: 'Markdown'
+      });
+      return;
+    }
+
+    // 🚀 3. START FRESH PART RENDER
+    await bot.answerCallbackQuery(query.id, {
+      text: `🚀 Part ${partNum} (${startPage}-${endPage}) render shuru ho gaya!`
+    });
+
+    const docMeta = cacheManager.getDoc(docId) || {};
+    startDownloadTask(chatId, userId, query.from, docId, null, {
+      isPart: true,
+      startPage,
+      endPage,
+      partNum,
+      totalParts,
+      title: docMeta.title
+    });
   }
 });
 

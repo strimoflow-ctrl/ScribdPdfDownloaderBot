@@ -148,7 +148,16 @@ async function splitPdfIfOversized(pdfPath, docTitle, totalPages, maxBytes = 49.
  * Download a Scribd document as a 100% pixel-perfect, complete PDF
  * Zero White Pages • Adaptive Quality • Under 50MB Guarantee
  */
-async function downloadScribdDocument(docId, onProgress = () => {}, botUsername = 'ScribdPdfDownloaderBot', preferredTitle = null) {
+async function downloadScribdDocument(docId, onProgress = () => {}, botUsername = 'ScribdPdfDownloaderBot', preferredTitle = null, options = {}) {
+  const {
+    startPage = 1,
+    endPage = null,
+    partNum = null,
+    totalParts = null,
+    forceFull = false,
+    maxPartPages = 250
+  } = options;
+
   const executablePath = getBrowserExecutablePath();
   const downloadsDir = path.join(__dirname, 'downloads');
   if (!fs.existsSync(downloadsDir)) {
@@ -285,6 +294,29 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       return pageElements.length || 1;
     });
 
+    const partChunkSize = maxPartPages || 250;
+    // ⚡ SMART MULTI-PART DETECTION:
+    // If document is > 300 pages and user didn't request a specific part range:
+    if (totalPages > 300 && !forceFull && !options.startPage) {
+      console.log(`📚 [Multi-Part Detected] Doc ${docId} has ${totalPages} pages. Returning parts blueprint.`);
+      await browser.close().catch(() => {});
+      browser = null;
+      return {
+        isMultiPart: true,
+        docId,
+        title: docTitle,
+        totalPages,
+        partSize: partChunkSize,
+        totalParts: Math.ceil(totalPages / partChunkSize)
+      };
+    }
+
+    // Determine effective page range for this render session
+    const effectiveStart = Math.max(1, startPage || 1);
+    const effectiveEnd = endPage ? Math.min(totalPages, endPage) : totalPages;
+    const totalPagesToRender = effectiveEnd - effectiveStart + 1;
+    const isSinglePart = Boolean(partNum && totalParts);
+
     // Hide UI overlays
     await page.evaluate(() => {
       const toHide = [
@@ -302,18 +334,32 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     let targetDeviceScale = 1.15;
     let targetJpegQuality = 82;
 
-    if (totalPages > 350) {
+    if (totalPagesToRender > 350) {
       targetDeviceScale = 0.85;
       targetJpegQuality = 70;
-    } else if (totalPages > 150) {
+    } else if (totalPagesToRender > 150) {
       targetDeviceScale = 0.95;
       targetJpegQuality = 75;
-    } else if (totalPages > 40) {
+    } else if (totalPagesToRender > 40) {
       targetDeviceScale = 1.05;
       targetJpegQuality = 78;
     }
 
     await page.setViewport({ width: 1250, height: 2200, deviceScaleFactor: targetDeviceScale });
+
+    // Jump page viewer directly to effectiveStart if not page 1
+    if (effectiveStart > 1) {
+      console.log(`⏩ [Fast Jump] Jumping viewer directly to start page ${effectiveStart}...`);
+      await page.evaluate((s) => {
+        if (window.docManager && typeof window.docManager.goto_page === 'function') {
+          window.docManager.goto_page(s);
+        } else {
+          const el = document.getElementById(`outer_page_${s}`);
+          if (el) el.scrollIntoView({ block: 'start' });
+        }
+      }, effectiveStart);
+      await new Promise(r => setTimeout(r, 1500));
+    }
 
     const CHUNK_SIZE = 35;
     let currentChunkDoc = await PDFDocument.create();
@@ -321,21 +367,26 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     let chunkCount = 0;
     let totalPagesCaptured = 0;
 
-    // Stage 2: Rendering Pages (0% -> 100%)
-    for (let i = 1; i <= totalPages; i++) {
-      const renderPercent = Math.round((i / totalPages) * 95);
+    // Stage 2: Rendering Pages (effectiveStart -> effectiveEnd)
+    for (let i = effectiveStart; i <= effectiveEnd; i++) {
+      const pageIdxInPart = i - effectiveStart + 1;
+      const renderPercent = Math.round((pageIdxInPart / totalPagesToRender) * 95);
 
       onProgress({
         stage: 'rendering',
         percent: renderPercent,
         currentPage: i,
-        totalPages,
+        totalPages: effectiveEnd,
         title: docTitle,
-        text: `⚡ *Rendering:* Page ${i} of ${totalPages}`
+        partNum,
+        totalParts,
+        text: isSinglePart
+          ? `⚡ *Part ${partNum}/${totalParts}:* Page ${i} (${pageIdxInPart} of ${totalPagesToRender})`
+          : `⚡ *Rendering:* Page ${i} of ${totalPages}`
       });
 
       // 🧹 TAB MEMORY FLUSH: Every 35 pages, reopen tab to prevent GPU leak
-      if (i > 1 && (i - 1) % 35 === 0) {
+      if (pageIdxInPart > 1 && (pageIdxInPart - 1) % 35 === 0) {
         console.log(`🧹 [Tab Memory Flush] Purging memory cache at Page ${i}...`);
         await page.close().catch(() => {});
         page = await browser.newPage();
@@ -480,7 +531,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       totalPagesCaptured++;
 
       // 💾 DISK CHUNKING: Save chunk every CHUNK_SIZE pages
-      if (i % CHUNK_SIZE === 0 || i === totalPages) {
+      if (pageIdxInPart % CHUNK_SIZE === 0 || i === effectiveEnd) {
         if (currentChunkDoc.getPageCount() > 0) {
           chunkCount++;
           const chunkPath = path.join(downloadsDir, `temp_chunk_${docId}_${chunkCount}.pdf`);
@@ -491,7 +542,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         }
 
         currentChunkDoc = null;
-        if (i < totalPages) {
+        if (i < effectiveEnd) {
           currentChunkDoc = await PDFDocument.create();
           currentChunkFont = await currentChunkDoc.embedFont(StandardFonts.HelveticaBold);
         }
@@ -510,23 +561,29 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     } catch (e) {}
 
     // Clean, professional filename
-    const cleanFileName = (docTitle || `Scribd_Doc_${docId}`)
+    let cleanFileName = (docTitle || `Scribd_Doc_${docId}`)
       .replace(/[/\\?%*:|"<>]/g, '')
       .replace(/&amp;/g, '&')
       .replace(/\s+/g, '-')
       .replace(/-+/g, '-')
-      .slice(0, 50)
+      .slice(0, 45)
       .replace(/^-+|-+$/g, '') || `Scribd_${docId}`;
+
+    if (isSinglePart) {
+      cleanFileName += `_Part${partNum}_of_${totalParts}_(Pages_${effectiveStart}-${effectiveEnd})`;
+    }
 
     const rawOutputPath = path.join(downloadsDir, `${cleanFileName}.pdf`);
 
     onProgress({
       stage: 'uploading',
       percent: 98,
-      text: `📦 *Assembling final HD PDF document (${totalPages} Pages)...*`
+      text: isSinglePart
+        ? `📦 *Assembling HD PDF Part ${partNum} (${totalPagesToRender} Pages)...*`
+        : `📦 *Assembling final HD PDF document (${totalPages} Pages)...*`
     });
 
-    let finalPageCount = totalPages;
+    let finalPageCount = totalPagesToRender;
 
     if (tempChunks.length === 1) {
       fs.renameSync(tempChunks[0], rawOutputPath);
@@ -559,7 +616,12 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
       files: deliveryFiles,
       title: docTitle,
       pageCount: finalPageCount,
-      fileSizeMB: totalSizeMB
+      fileSizeMB: totalSizeMB,
+      isPart: isSinglePart,
+      partNum,
+      totalParts,
+      pageRange: `${effectiveStart}-${effectiveEnd}`,
+      totalPages
     };
   } finally {
     if (browser) {
@@ -569,6 +631,11 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     for (const cp of tempChunks) {
       try { if (fs.existsSync(cp)) fs.unlinkSync(cp); } catch (e) {}
     }
+    // Clean system temp Chromium files
+    try {
+      const { cacheManager } = require('./cache');
+      cacheManager.cleanSystemTemp();
+    } catch (e) {}
   }
 }
 

@@ -12,6 +12,7 @@ downloads/
 *.png
 *.jpg
 *.log
+cache.json.tmp
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
