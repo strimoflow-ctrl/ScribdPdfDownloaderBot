@@ -158,6 +158,26 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
   const tempChunks = [];
   let browser = null;
 
+  // 🌐 Optional Proxy Configuration (Webshare, IPRoyal, Smartproxy, etc.)
+  const proxyUrl = process.env.PROXY_URL || process.env.PROXY_SERVER || '';
+  let proxyServerArg = '';
+  let proxyAuth = null;
+
+  if (proxyUrl) {
+    try {
+      const parsed = new URL(proxyUrl.startsWith('http') ? proxyUrl : `http://${proxyUrl}`);
+      proxyServerArg = `--proxy-server=${parsed.protocol}//${parsed.hostname}:${parsed.port}`;
+      if (parsed.username && parsed.password) {
+        proxyAuth = {
+          username: decodeURIComponent(parsed.username),
+          password: decodeURIComponent(parsed.password)
+        };
+      }
+    } catch (e) {
+      proxyServerArg = `--proxy-server=${proxyUrl}`;
+    }
+  }
+
   // Stage 1: Connecting (0% -> 100%)
   onProgress({
     stage: 'connecting',
@@ -165,30 +185,40 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
     text: '🚀 *Launching browser engine...*'
   });
 
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-accelerated-2d-canvas',
+    '--disable-background-networking',
+    '--disable-extensions',
+    '--disable-component-update',
+    '--disable-default-apps',
+    '--mute-audio',
+    '--no-first-run',
+    '--no-zygote',
+    '--js-flags=--max-old-space-size=512',
+    '--window-size=1200,1600'
+  ];
+
+  if (proxyServerArg) {
+    launchArgs.push(proxyServerArg);
+    console.log(`🌐 [Proxy Active] Routing browser traffic through proxy: ${proxyServerArg}`);
+  }
+
   browser = await puppeteer.launch({
     headless: 'new',
     executablePath,
     protocolTimeout: 600000,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-accelerated-2d-canvas',
-      '--disable-background-networking',
-      '--disable-extensions',
-      '--disable-component-update',
-      '--disable-default-apps',
-      '--mute-audio',
-      '--no-first-run',
-      '--no-zygote',
-      '--js-flags=--max-old-space-size=512',
-      '--window-size=1200,1600'
-    ]
+    args: launchArgs
   });
 
   try {
     let page = await browser.newPage();
+    if (proxyAuth) {
+      await page.authenticate(proxyAuth);
+    }
     page.setDefaultNavigationTimeout(60000);
     page.setDefaultTimeout(60000);
 
@@ -309,6 +339,9 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         console.log(`🧹 [Tab Memory Flush] Purging memory cache at Page ${i}...`);
         await page.close().catch(() => {});
         page = await browser.newPage();
+        if (proxyAuth) {
+          await page.authenticate(proxyAuth);
+        }
         page.setDefaultNavigationTimeout(60000);
         page.setDefaultTimeout(60000);
         await page.setViewport({ width: 1100, height: 1500, deviceScaleFactor: targetDeviceScale });
@@ -330,7 +363,7 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
         });
       }
 
-      // 1. TRIGGER SCRIBD REAL INTERNAL LOADER
+      // 1. HUMAN-LIKE SCROLL & SCRIBD INTERNAL ASSET TRIGGER
       await page.evaluate((idx) => {
         const mgr = window.docManager;
         if (mgr && mgr.pages && mgr.pages[idx]) {
@@ -338,15 +371,18 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
           if (!p.loadHasStarted) {
             try { p.load(); } catch (e) {}
           }
+          try { p.display(); } catch (e) {}
+          try { p.turnOnImages(); } catch (e) {}
         }
-        const scroller = document.querySelector('.document_scroller');
+
+        const scroller = document.querySelector('.document_scroller') || window;
         const el = document.getElementById(`outer_page_${idx}`);
         if (el) {
-          if (scroller) {
-            scroller.scrollTop = el.offsetTop;
+          if (scroller !== window) {
+            scroller.scrollTop = Math.max(0, el.offsetTop - 20);
             scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
           }
-          el.scrollIntoView({ behavior: 'instant', block: 'start' });
+          el.scrollIntoView({ behavior: 'instant', block: 'center' });
         }
       }, i);
 
@@ -362,7 +398,9 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
             if (p.innerPageElem) {
               try { p.display(); } catch (e) {}
               try { p.turnOnImages(); } catch (e) {}
-              return true;
+              if (p.innerPageElem.children.length > 0 || p.innerPageElem.innerHTML.length > 50) {
+                return true;
+              }
             }
           }
 
@@ -370,33 +408,52 @@ async function downloadScribdDocument(docId, onProgress = () => {}, botUsername 
           if (!el) return false;
 
           const img = el.querySelector('img');
-          if (img && img.src && (img.complete || img.naturalWidth > 50)) return true;
+          if (img && img.src && (img.complete || img.naturalWidth > 20)) return true;
+
+          const canvas = el.querySelector('canvas');
+          if (canvas) return true;
+
+          const svg = el.querySelector('svg');
+          if (svg && svg.children.length > 0) return true;
 
           const newpage = el.querySelector('.newpage');
-          if (newpage && (newpage.querySelector('svg') || newpage.querySelector('canvas') || newpage.innerHTML.trim().length > 150)) {
+          if (newpage && (newpage.querySelector('svg') || newpage.querySelector('canvas') || newpage.innerHTML.trim().length > 100)) {
             return true;
           }
 
           const textLayer = el.querySelector('.text_layer');
-          if (textLayer && textLayer.textContent && textLayer.textContent.trim().length > 5) return true;
+          if (textLayer && textLayer.textContent && textLayer.textContent.trim().length > 3) return true;
 
           return false;
         }, i);
 
         if (contentReady) break;
-        await new Promise(r => setTimeout(r, 120));
+
+        // Human-like scroll jiggle to trigger lazy-load intersection observers
+        if (Date.now() - waitStart > 1200) {
+          await page.evaluate((idx) => {
+            const scroller = document.querySelector('.document_scroller') || window;
+            const el = document.getElementById(`outer_page_${idx}`);
+            if (el && scroller !== window) {
+              scroller.scrollTop = el.offsetTop + 30;
+              scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              setTimeout(() => {
+                scroller.scrollTop = Math.max(0, el.offsetTop - 20);
+                scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+              }, 40);
+            }
+            const mgr = window.docManager;
+            if (mgr && mgr.pages && mgr.pages[idx]) {
+              try { mgr.pages[idx].load(); } catch (e) {}
+            }
+          }, i);
+        }
+
+        await new Promise(r => setTimeout(r, 100));
       }
 
-      // Secondary fallback nudge if page took longer
-      if (!contentReady) {
-        await page.evaluate((idx) => {
-          const mgr = window.docManager;
-          if (mgr && mgr.pages && mgr.pages[idx]) {
-            try { mgr.pages[idx].load(); } catch (e) {}
-          }
-        }, i);
-        await new Promise(r => setTimeout(r, 1000));
-      }
+      // Small 150ms settling delay after content is ready to ensure full render before snapshot
+      await new Promise(r => setTimeout(r, 150));
 
       const pageElement = await page.$(`#outer_page_${i}`);
       if (!pageElement) {
